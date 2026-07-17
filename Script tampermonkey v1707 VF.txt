@@ -1,0 +1,1754 @@
+// ==UserScript==
+// @name         EAFC Drupal - Mise à jour parcours depuis Mapping JSON + Excel
+// @namespace    https://eafc.local/tampermonkey
+// @version      1.0.37
+// @description  Met à jour des pages de parcours Drupal depuis un mapping JSON externe et un export Excel EAFC Formation Export plan et sessions.
+// @author       EAFC
+// @match        *://*/*
+// @run-at       document-idle
+// @grant        GM_addStyle
+// @grant        GM_download
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @require      https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const SCRIPT_VERSION = '1.0.37';
+
+  /***************************************************************************
+   * CONFIGURATION GLOBALE
+   ***************************************************************************/
+  const CONFIG = {
+    DRY_RUN: true,
+    AUTO_SAVE: false,
+    SAFE_CLICK_MODE: true,
+    DELAY_BETWEEN_ACTIONS: 500,
+    MAX_WAIT_TIME: 15000,
+    ADMIN_CONTENT_URL: '/admin/content',
+    PREINSCRIPTION_BUTTON_TEXT: 'Préinscrivez vous',
+    CALLOUT_BODY_TEXT: '<h2>\n    Préinscriptions\n</h2>',
+    CALLOUT_COLOR_VALUE: 'blue-cumulus',
+    ADVANCED_FORMAT_VALUE: 'formatage_avance',
+    // Correspondance demandée : le mapping JSON donne l'identifiant dispositif,
+    // l'Excel est retrouvé via la colonne exacte/souple "Dispositif : code".
+    // Le module reste conservé pour les logs et diagnostics, mais n'est plus bloquant.
+    MATCH_EXCEL_BY_DISPOSITIF_ONLY: true
+  };
+
+  const SELECTORS = {
+    adminMenu: [
+      'button#toolbar-item-administration',
+      'button[title="Menu d\'administration"]',
+      '.toolbar-icon-menu.trigger.toolbar-item'
+    ],
+    contentLink: [
+      'a[href="/admin/content"]',
+      'a[data-drupal-link-system-path="admin/content"]'
+    ],
+    nidFilter: [
+      'input[data-drupal-selector="edit-nid"]',
+      'input#edit-nid',
+      'input[name="nid"]'
+    ],
+    filterButton: [
+      'input[data-drupal-selector="edit-submit-content"]',
+      'input#edit-submit-content',
+      'input[value="Filtrer"]'
+    ],
+    resultTitleLink: [
+      'table.views-table tbody tr:first-child td[headers="view-title-table-column"].views-field-title > a[href]',
+      'table.views-table tbody tr:first-child td[headers="view-title-table-column"] > a[href]',
+      'td[headers="view-title-table-column"].views-field-title > a[href]',
+      'td[headers="view-title-table-column"] > a[href]',
+      'td.views-field-title > a[href]'
+    ],
+    editLinks: [
+      'a[href$="/edit"]',
+      'a[href*="/edit?"]',
+      'a[href*="/node/"][href*="/edit"]',
+      'a:contains("Modifier")'
+    ],
+    startDate: [
+      'input[data-drupal-selector="edit-field-event-start-date-0-value-date"]',
+      'input#edit-field-event-start-date-0-value-date',
+      'input[name="field_event_start_date[0][value][date]"]'
+    ],
+    endDate: [
+      'input[data-drupal-selector="edit-field-event-end-date-0-value-date"]',
+      'input#edit-field-event-end-date-0-value-date',
+      'input[name="field_event_end_date[0][value][date]"]'
+    ],
+    unpublishDate: [
+      'input[data-drupal-selector="edit-unpublish-on-0-value-date"]',
+      'input#edit-unpublish-on-0-value-date',
+      'input[name="unpublish_on[0][value][date]"]'
+    ],
+    formationBodyEdit: [
+      'input[name="field_formation_body_0_edit"][value="Modifier"]',
+      'input[data-drupal-selector^="field-formation-body-0-edit"][value="Modifier"]',
+      'input.paragraphs-icon-button-edit[title="Modifier"]',
+      'input.paragraphs-icon-button-edit[value="Modifier"]'
+    ],
+    textFormat: [
+      'select[data-drupal-selector*="field-richtext-content"][data-drupal-selector$="-format"]',
+      'select[name*="[field_richtext_content]"][name$="[format]"]',
+      'select.editor.form-select'
+    ],
+    ckSourceButton: [
+      'button.ck-source-editing-button',
+      'button[data-cke-tooltip-text="Source"]',
+      'button[aria-labelledby*="ck-editor"]'
+    ],
+    ckSourceArea: [
+      '.ck-source-editing-area textarea',
+      'textarea.ck-source-editing-area',
+      '.ck-source-editing-area [contenteditable="true"]',
+      'textarea[data-drupal-selector*="field-richtext-content"]:not([aria-hidden="true"])',
+      'textarea[name*="field_richtext_content"]'
+    ],
+    addParagraph: [
+      'input.field-add-more-submit.paragraph-type-add-modal-button',
+      'input[data-drupal-selector*="field-formation-body-add-more"]',
+      'input[value="Ajouter Paragraphe"]'
+    ],
+    calloutOverlay: [
+      '.paragraphs-button--icon_overlay--wrapper',
+      '.paragraphs-button--icon_overlay'
+    ],
+    calloutIcon: [
+      'button[name="field_formation_body_callout_add_more"] .paragraphs-button--icon[style*="callout-default-icon"]',
+      'button[data-drupal-selector^="field-formation-body-callout-add-more"] .paragraphs-button--icon[style*="callout-default-icon"]',
+      '.paragraphs-button--icon[style*="callout-default-icon"]'
+    ],
+    calloutButton: [
+      'button[name="field_formation_body_callout_add_more"][value="Mise en avant"]',
+      'button[data-drupal-selector^="field-formation-body-callout-add-more"]',
+      'button.field-add-more-submit.paragraphs-button--add-more[value="Mise en avant"]',
+      'button.paragraphs-button--add-more[value="Mise en avant"]',
+      'button[value="Mise en avant"]',
+      'input[type="submit"][value="Mise en avant"]',
+      'button[data-drupal-selector*="mise-en-avant"]',
+      'input[data-drupal-selector*="mise-en-avant"]'
+    ],
+    calloutUri: [
+      'input[data-drupal-selector^="edit-field-formation-body-"][data-drupal-selector$="-subform-field-callout-cta-0-uri"]',
+      'input[name^="field_formation_body["][name$="[subform][field_callout_cta][0][uri]"]',
+      'input[name*="[field_callout_cta]"][name$="[uri]"]',
+      'input[data-drupal-selector*="field-callout-cta"][data-drupal-selector$="-uri"]',
+      'input.form-autocomplete[name*="field_callout_cta"]'
+    ],
+    calloutTitle: [
+      'input[data-drupal-selector^="edit-field-formation-body-"][data-drupal-selector$="-subform-field-callout-cta-0-title"]',
+      'input[name^="field_formation_body["][name$="[subform][field_callout_cta][0][title]"]',
+      'input[name*="[field_callout_cta]"][name$="[title]"]',
+      'input[data-drupal-selector*="field-callout-cta"][data-drupal-selector$="-title"]'
+    ],
+    calloutContentFormat: [
+      'select[data-drupal-selector^="edit-field-formation-body-"][data-drupal-selector$="-subform-field-callout-content-0-format"]',
+      'select[name^="field_formation_body["][name$="[subform][field_callout_content][0][format]"]'
+    ],
+    calloutSourceButton: [
+      'button.ck-source-editing-button',
+      'button[data-cke-tooltip-text="Source"]',
+      'span.ck-button__label'
+    ],
+    calloutSourceTextarea: [
+      'textarea[aria-label="Source code editing area"]',
+      '.ck-source-editing-area textarea'
+    ],
+    calloutColor: [
+      'select[data-drupal-selector^="edit-field-formation-body-"][data-drupal-selector$="-subform-field-callout-color"]',
+      'select[name^="field_formation_body["][name$="[subform][field_callout_color]"]',
+      'select[name*="[field_callout_color]"]',
+      'select[data-drupal-selector*="field-callout-color"]'
+    ],
+    save: [
+      'input[data-drupal-selector="edit-submit"]',
+      'input#edit-submit',
+      'input[name="op"][value="Enregistrer"]',
+      'input.button--primary[value="Enregistrer"]'
+    ]
+  };
+
+  const COLUMN_NAMES = {
+    dispositif: ['Dispositif : code', 'dispositif : code', 'dispositif code', 'dispositif', 'identifiant', 'code dispositif', 'dispositifCode', 'Dispositif', 'Identifiant'],
+    module: ['module', 'code module', 'moduleCode', 'Code', 'Module', 'Code module'],
+    rne: ['RNE', 'rne', 'UAI', 'uai', 'code RNE', 'code UAI', 'Établissement : RNE', 'Etablissement : RNE'],
+    groupId: ['Groupe : identifiant', 'Groupe : code', 'groupe', 'groupId', 'Identifiant groupe', 'id groupe'],
+    sessionLabel: ['Session : libellé', 'Session : code', 'session', 'sessionLabel', 'Code session', 'Identifiant session'],
+    territoire: ['territoire', 'territoireCode', 'département', 'departement', 'Département', 'code département', 'code departement'],
+    modalite: ['modalité', 'modalite', 'Modalité', 'Modalite', 'modalité session', 'modalite session', 'type formation'],
+    sessionStart: ['Début', 'Debut', 'début', 'debut', 'Session : début', 'Session : debut', 'Session : date début', 'Session : date debut', 'Date début session', 'Date debut session', 'date et heure de début', 'date et heure de debut', 'Début session', 'Debut session'],
+    sessionEnd: ['Fin', 'fin', 'Session : fin', 'Session : date fin', 'Date fin session', 'date et heure de fin', 'Fin session'],
+    lieu: ['lieu', 'Lieu', 'Lieux', 'site', 'localisation'],
+    start: ['Préinscriptions : Publication : début', 'Publication début', 'début publication', 'date début préinscription', 'date debut preinscription', 'startDate'],
+    end: ['Préinscriptions : Publication : fin', 'Publication fin', 'fin publication', 'date fin préinscription', 'date fin preinscription', 'endDate'],
+    link: ['Préinscriptions : Publication : lien préinscription', 'lien préinscription', 'lien de préinscription', 'url préinscription', 'url', 'link'],
+    total: ['Préinscriptions : Préinscrits : nombre total', 'nombre total', 'préinscrits total', 'inscrits', 'total'],
+    max: ['Préinscriptions : Préinscrits : nombre maximal', 'nombre maximal', 'capacité', 'capacité maximale', 'max', 'places']
+  };
+
+  const STORAGE_KEYS = {
+    mappingItems: 'eafcDrupalUpdater.mappingItems.v1',
+    excelRows: 'eafcDrupalUpdater.excelRows.v1',
+    savedAt: 'eafcDrupalUpdater.savedAt.v1',
+    batchState: 'eafcDrupalUpdater.batchState.v1',
+    uiConfig: 'eafcDrupalUpdater.uiConfig.v1',
+    updateReport: 'eafcDrupalUpdater.updateReport.v1'
+  };
+
+  const state = {
+    mappingItems: [],
+    excelRows: [],
+    excelIndex: new Map(),
+    enrichedItems: [],
+    validationErrors: [],
+    logs: [],
+    updateReport: [],
+    running: false,
+    stopRequested: false,
+    panelCollapsed: false,
+    lastSummary: { mapping: 0, excel: 0, matches: 0, errors: 0 }
+  };
+
+  /***************************************************************************
+   * INTERFACE TAMPERMONKEY
+   ***************************************************************************/
+  function initPanel() {
+    GM_addStyle(`
+      #eafc-updater-panel{position:fixed;right:18px;bottom:18px;z-index:2147483647;width:390px;max-height:88vh;background:#fff;border:2px solid #000091;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.25);font:13px/1.35 Arial,sans-serif;color:#161616;overflow:hidden}
+      #eafc-updater-panel.eafc-collapsed{width:260px}.eafc-header{display:flex;align-items:center;justify-content:space-between;gap:8px;background:#000091;color:#fff;padding:10px 12px;font-weight:700}.eafc-toggle{background:#fff;color:#000091;border:0;border-radius:4px;padding:4px 8px;cursor:pointer}.eafc-body{padding:12px;max-height:calc(88vh - 45px);overflow:auto}.eafc-collapsed .eafc-body{display:none}.eafc-row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}.eafc-btn{border:1px solid #000091;background:#000091;color:#fff;border-radius:4px;padding:7px 9px;cursor:pointer}.eafc-btn.secondary{background:#fff;color:#000091}.eafc-btn.danger{background:#ce0500;border-color:#ce0500}.eafc-btn:disabled{opacity:.55;cursor:not-allowed}.eafc-file{display:none}.eafc-summary{display:grid;grid-template-columns:1fr auto;gap:4px;background:#f6f6f6;border-radius:6px;padding:8px;margin:8px 0}.eafc-options label{display:block;margin:6px 0}.eafc-number{width:95px;max-width:100%;padding:3px 5px;border:1px solid #aaa;border-radius:4px}.eafc-alert{background:#fff4d6;border-left:4px solid #ffb000;padding:8px;margin:8px 0}.eafc-errors{max-height:130px;overflow:auto;border:1px solid #ddd;margin-top:8px}.eafc-errors table{border-collapse:collapse;width:100%;font-size:11px}.eafc-errors th,.eafc-errors td{border:1px solid #ddd;padding:3px;text-align:left}.eafc-logbox{height:180px;overflow:auto;background:#1e1e1e;color:#eee;border-radius:6px;padding:8px;font:11px/1.35 Consolas,monospace}.eafc-log-info{color:#d5e9ff}.eafc-log-success{color:#b8f5c2}.eafc-log-warning{color:#ffe08a}.eafc-log-error{color:#ffb3ad}.eafc-small{font-size:11px;color:#666}.eafc-version{font-size:11px;font-weight:700;color:#fff;background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.45);border-radius:999px;padding:2px 7px;white-space:nowrap}.eafc-status{font-weight:700;margin-top:8px}
+    `);
+
+    const panel = document.createElement('div');
+    panel.id = 'eafc-updater-panel';
+    panel.innerHTML = `
+      <div class="eafc-header"><span>Mise à jour parcours EAFC</span><span class="eafc-version">v${SCRIPT_VERSION}</span><button class="eafc-toggle" type="button">−</button></div>
+      <div class="eafc-body">
+        <input id="eafc-mapping-file" class="eafc-file" type="file" accept="application/json,.json">
+        <input id="eafc-excel-file" class="eafc-file" type="file" accept=".xlsx,.xls,.xlsm,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel">
+        <div class="eafc-row">
+          <button id="eafc-import-mapping" class="eafc-btn secondary" type="button">Importer mapping JSON</button>
+          <button id="eafc-import-excel" class="eafc-btn secondary" type="button">Importer Excel</button>
+        </div>
+        <div class="eafc-summary" id="eafc-summary"></div>
+        <div class="eafc-options">
+          <label><input id="eafc-dry-run" type="checkbox" checked> Mode simulation</label>
+          <label><input id="eafc-auto-save" type="checkbox"> Enregistrer automatiquement</label>
+          <label><input id="eafc-safe-click" type="checkbox" checked> Mode sécurité : validation à chaque clic</label>
+          <label>Vitesse des clics (ms) <input id="eafc-click-delay" class="eafc-number" type="number" min="0" step="50" value="500"></label>
+        </div>
+        <div class="eafc-alert" id="eafc-alert">Importez le mapping JSON et l'Excel, puis analysez les correspondances.</div>
+        <div class="eafc-row">
+          <button id="eafc-analyze" class="eafc-btn secondary" type="button">Analyser les correspondances</button>
+          <button id="eafc-start" class="eafc-btn" type="button">Démarrer</button>
+          <button id="eafc-stop" class="eafc-btn danger" type="button">Stop</button>
+          <button id="eafc-export" class="eafc-btn secondary" type="button">Exporter les logs</button>
+          <button id="eafc-export-report" class="eafc-btn secondary" type="button">Exporter bilan Excel</button>
+          <button id="eafc-reset-imports" class="eafc-btn danger" type="button">Reset JSON/Excel</button>
+        </div>
+        <div id="eafc-errors" class="eafc-errors" hidden></div>
+        <div class="eafc-status" id="eafc-status">Prêt.</div>
+        <div class="eafc-logbox" id="eafc-logbox"></div>
+        <div class="eafc-small">Les codes Sofia-FMO/GAIA servent uniquement à la correspondance et ne sont jamais injectés dans le HTML Drupal.</div>
+      </div>`;
+    document.body.appendChild(panel);
+    loadPersistedUpdateReport();
+
+    qs('#eafc-import-mapping').addEventListener('click', () => qs('#eafc-mapping-file').click());
+    qs('#eafc-import-excel').addEventListener('click', () => qs('#eafc-excel-file').click());
+    qs('#eafc-mapping-file').addEventListener('change', (e) => e.target.files[0] && handleMappingFile(e.target.files[0]));
+    qs('#eafc-excel-file').addEventListener('change', (e) => e.target.files[0] && handleExcelFile(e.target.files[0]));
+    applyUiConfigToPanel();
+    qs('#eafc-dry-run').addEventListener('change', (e) => { CONFIG.DRY_RUN = e.target.checked; persistUiConfig(); renderSummary(); });
+    qs('#eafc-auto-save').addEventListener('change', (e) => { CONFIG.AUTO_SAVE = e.target.checked; persistUiConfig(); renderSummary(); });
+    qs('#eafc-safe-click').addEventListener('change', (e) => { CONFIG.SAFE_CLICK_MODE = e.target.checked; persistUiConfig(); renderSummary(); });
+    qs('#eafc-click-delay').addEventListener('change', (e) => { CONFIG.DELAY_BETWEEN_ACTIONS = sanitizeDelay(e.target.value); e.target.value = String(CONFIG.DELAY_BETWEEN_ACTIONS); persistUiConfig(); renderSummary(); });
+    qs('#eafc-analyze').addEventListener('click', analyzeCorrespondences);
+    qs('#eafc-start').addEventListener('click', runUpdateBatch);
+    qs('#eafc-stop').addEventListener('click', () => { state.stopRequested = true; clearBatchState(); log('warning', null, 'Arrêt demandé par l’utilisateur.'); setStatus('Arrêt demandé…'); });
+    qs('#eafc-export').addEventListener('click', exportLogs);
+    qs('#eafc-export-report').addEventListener('click', exportUpdateReportExcel);
+    qs('#eafc-reset-imports').addEventListener('click', resetImportedData);
+    qs('.eafc-toggle').addEventListener('click', () => {
+      state.panelCollapsed = !state.panelCollapsed;
+      panel.classList.toggle('eafc-collapsed', state.panelCollapsed);
+      qs('.eafc-toggle').textContent = state.panelCollapsed ? '+' : '−';
+    });
+    renderSummary();
+  }
+
+  function renderSummary() {
+    const s = state.lastSummary;
+    qs('#eafc-summary').innerHTML = `
+      <span>Lignes mapping</span><strong>${s.mapping}</strong>
+      <span>Lignes Excel</span><strong>${s.excel}</strong>
+      <span>Correspondances trouvées</span><strong>${s.matches}</strong>
+      <span>Erreurs</span><strong>${s.errors}</strong>
+      <span>Simulation</span><strong>${CONFIG.DRY_RUN ? 'Oui' : 'Non'}</strong>
+      <span>Auto-save</span><strong>${CONFIG.AUTO_SAVE ? 'Oui' : 'Non'}</strong>
+      <span>Sécurité clic</span><strong>${CONFIG.SAFE_CLICK_MODE ? 'Oui' : 'Non'}</strong>
+      <span>Vitesse clics</span><strong>${CONFIG.DELAY_BETWEEN_ACTIONS} ms</strong>`;
+  }
+
+  function renderErrors() {
+    const box = qs('#eafc-errors');
+    if (!state.validationErrors.length) { box.hidden = true; box.innerHTML = ''; return; }
+    box.hidden = false;
+    box.innerHTML = `<table><thead><tr><th>ID Drupal</th><th>Titre</th><th>Erreur</th></tr></thead><tbody>${state.validationErrors.map((e) => `<tr><td>${escapeHtml(e.item?.drupalParcoursId || '')}</td><td>${escapeHtml(e.item?.drupalTitle || '')}</td><td>${escapeHtml(e.message)}</td></tr>`).join('')}</tbody></table>`;
+  }
+
+
+  function sanitizeDelay(value) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed) || parsed < 0) return 0;
+    return Math.min(parsed, 10000);
+  }
+
+  /***************************************************************************
+   * PERSISTANCE DES CHOIX UTILISATEUR
+   ***************************************************************************/
+  function loadPersistedUiConfig() {
+    const saved = readStoredJson(STORAGE_KEYS.uiConfig, null);
+    if (!saved) return;
+    CONFIG.DRY_RUN = saved.DRY_RUN !== undefined ? Boolean(saved.DRY_RUN) : CONFIG.DRY_RUN;
+    CONFIG.AUTO_SAVE = saved.AUTO_SAVE !== undefined ? Boolean(saved.AUTO_SAVE) : CONFIG.AUTO_SAVE;
+    CONFIG.SAFE_CLICK_MODE = saved.SAFE_CLICK_MODE !== undefined ? Boolean(saved.SAFE_CLICK_MODE) : CONFIG.SAFE_CLICK_MODE;
+    CONFIG.DELAY_BETWEEN_ACTIONS = saved.DELAY_BETWEEN_ACTIONS !== undefined ? sanitizeDelay(saved.DELAY_BETWEEN_ACTIONS) : CONFIG.DELAY_BETWEEN_ACTIONS;
+  }
+
+  function persistUiConfig() {
+    writeStoredJson(STORAGE_KEYS.uiConfig, {
+      DRY_RUN: CONFIG.DRY_RUN,
+      AUTO_SAVE: CONFIG.AUTO_SAVE,
+      SAFE_CLICK_MODE: CONFIG.SAFE_CLICK_MODE,
+      DELAY_BETWEEN_ACTIONS: CONFIG.DELAY_BETWEEN_ACTIONS
+    });
+  }
+
+  function applyUiConfigToPanel() {
+    qs('#eafc-dry-run').checked = CONFIG.DRY_RUN;
+    qs('#eafc-auto-save').checked = CONFIG.AUTO_SAVE;
+    qs('#eafc-safe-click').checked = CONFIG.SAFE_CLICK_MODE;
+    qs('#eafc-click-delay').value = String(CONFIG.DELAY_BETWEEN_ACTIONS);
+  }
+
+
+  /***************************************************************************
+   * PERSISTANCE DES IMPORTS ENTRE LES PAGES DRUPAL
+   ***************************************************************************/
+  function loadPersistedImports() {
+    const persistedMapping = readStoredJson(STORAGE_KEYS.mappingItems, []);
+    const persistedExcelRows = readStoredJson(STORAGE_KEYS.excelRows, []);
+    const savedAt = readStoredValue(STORAGE_KEYS.savedAt, '');
+
+    if (Array.isArray(persistedMapping) && persistedMapping.length) {
+      state.mappingItems = persistedMapping;
+      state.lastSummary.mapping = persistedMapping.length;
+    }
+
+    if (Array.isArray(persistedExcelRows) && persistedExcelRows.length) {
+      state.excelRows = persistedExcelRows;
+      state.excelIndex = buildExcelIndex(state.excelRows);
+      state.lastSummary.excel = persistedExcelRows.length;
+    }
+
+    if (state.mappingItems.length || state.excelRows.length) {
+      analyzeCorrespondences(false);
+      const restored = `Imports restaurés automatiquement${savedAt ? ` depuis ${savedAt}` : ''} : ${state.mappingItems.length} ligne(s) mapping, ${state.excelRows.length} ligne(s) Excel.`;
+      setAlert(restored);
+      log('success', null, restored);
+      scheduleAutoResumeBatch();
+    } else {
+      renderSummary();
+    }
+  }
+
+  function persistImportedData(source) {
+    writeStoredJson(STORAGE_KEYS.mappingItems, state.mappingItems);
+    writeStoredJson(STORAGE_KEYS.excelRows, state.excelRows);
+    writeStoredValue(STORAGE_KEYS.savedAt, new Date().toLocaleString('fr-FR'));
+    log('info', null, `Import ${source} mémorisé : il sera restauré automatiquement après changement de page Drupal.`);
+  }
+
+
+  function resetImportedData() {
+    if (!window.confirm('Réinitialiser le mapping JSON, l’Excel et le batch en cours ?')) return;
+    state.mappingItems = [];
+    state.excelRows = [];
+    state.excelIndex = new Map();
+    state.enrichedItems = [];
+    state.validationErrors = [];
+    state.lastSummary = { mapping: 0, excel: 0, matches: 0, errors: 0 };
+    state.stopRequested = true;
+    deleteStoredValue(STORAGE_KEYS.mappingItems);
+    deleteStoredValue(STORAGE_KEYS.excelRows);
+    deleteStoredValue(STORAGE_KEYS.savedAt);
+    deleteStoredValue(STORAGE_KEYS.updateReport);
+    state.updateReport = [];
+    clearBatchState();
+    renderSummary();
+    renderErrors();
+    setAlert('Mapping JSON et Excel réinitialisés. Importez de nouveaux fichiers pour relancer un batch.');
+    setStatus('Imports réinitialisés.');
+    log('warning', null, 'Mapping JSON, Excel et batch en cours réinitialisés par l’utilisateur.');
+  }
+
+  function readStoredJson(key, fallback) {
+    try {
+      const value = readStoredValue(key, null);
+      if (!value) return fallback;
+      return typeof value === 'string' ? JSON.parse(value) : value;
+    } catch (error) {
+      console.warn('[EAFC] Lecture stockage impossible', key, error);
+      return fallback;
+    }
+  }
+
+  function writeStoredJson(key, value) {
+    writeStoredValue(key, JSON.stringify(value || []));
+  }
+
+  function readStoredValue(key, fallback) {
+    try {
+      if (typeof GM_getValue === 'function') return GM_getValue(key, fallback);
+      const value = window.localStorage.getItem(key);
+      return value == null ? fallback : value;
+    } catch (error) {
+      console.warn('[EAFC] GM_getValue/localStorage indisponible', key, error);
+      return fallback;
+    }
+  }
+
+  function writeStoredValue(key, value) {
+    try {
+      if (typeof GM_setValue === 'function') GM_setValue(key, value);
+      else window.localStorage.setItem(key, value);
+    } catch (error) {
+      console.warn('[EAFC] GM_setValue/localStorage indisponible', key, error);
+    }
+  }
+
+
+  function deleteStoredValue(key) {
+    try {
+      if (typeof GM_deleteValue === 'function') GM_deleteValue(key);
+      else window.localStorage.removeItem(key);
+    } catch (error) {
+      console.warn('[EAFC] GM_deleteValue/localStorage indisponible', key, error);
+    }
+  }
+
+  /***************************************************************************
+   * IMPORT MAPPING JSON
+   ***************************************************************************/
+  async function handleMappingFile(file) {
+    try {
+      const text = await file.text();
+      const parsed = parseMappingJson(text);
+      state.mappingItems = normalizeMappingItems(parsed.items || parsed);
+      log('success', null, `${state.mappingItems.length} ligne(s) de mapping importée(s).`);
+      state.lastSummary.mapping = state.mappingItems.length;
+      persistImportedData('mapping');
+      analyzeCorrespondences(false);
+    } catch (error) {
+      log('error', null, `Import mapping impossible : ${error.message}`);
+    }
+    renderSummary();
+  }
+
+  function parseMappingJson(json) {
+    const data = typeof json === 'string' ? JSON.parse(json) : json;
+    if (!data || (!Array.isArray(data) && !Array.isArray(data.items))) throw new Error('JSON invalide : items absent.');
+    return data;
+  }
+
+  function normalizeMappingItems(items) {
+    return (items || []).map((item) => {
+      const planSession = item.planSession || item.planSessions?.[0] || {};
+      const updateKey = item.tampermonkeyUpdateKeys?.[0] || planSession.tampermonkeyUpdateKey || {};
+      return {
+        drupalParcoursId: cleanCode(item.drupalParcoursId || item.drupalNodeId || item.nid || item.id),
+        drupalNodeId: cleanCode(item.drupalNodeId || item.drupalParcoursId || item.nid || item.id),
+        drupalTitle: String(item.drupalTitle || item.title || item.titre || ''),
+        dispositifCode: cleanCode(item.sofia?.dispositifCode || item.dispositifCode || item.identifiant || item.identifiantDispositif || item.dispositif || item['Dispositif : code'] || item['dispositif : code'] || ''),
+        dispositifLabel: String(item.sofia?.dispositifLabel || item.dispositifLabel || ''),
+        moduleCode: cleanCode(item.sofia?.moduleCode || item.moduleCode || item.module || ''),
+        moduleLabel: String(item.sofia?.moduleLabel || item.moduleLabel || ''),
+        territoireCode: normalizeTerritoireCode(item.territoire?.code || item.territoireCode || planSession.territoireCode || updateKey.territoireCode || planSession.departmentFromRne || ''),
+        territoireLabel: String(item.territoire?.label || item.territoireLabel || planSession.territoireLabel || ''),
+        rne: normalizeRne(item.rne || item.uai || planSession.rne || updateKey.rne || extractRneFromText(planSession.lieu || '')),
+        planSessionGroupId: cleanCode(planSession.groupId || item.groupId || ''),
+        planSessionLabel: cleanCode(planSession.sessionLabel || item.sessionLabel || ''),
+        mappingMode: String(item.mappingMode || 'single')
+      };
+    });
+  }
+
+  /***************************************************************************
+   * IMPORT EXCEL VIA SHEETJS
+   ***************************************************************************/
+  async function handleExcelFile(file) {
+    try {
+      const rows = await readExcelWorkbook(file);
+      state.excelRows = normalizeExcelRows(rows);
+      state.excelIndex = buildExcelIndex(state.excelRows);
+      log('success', null, `${state.excelRows.length} ligne(s) Excel importée(s).`);
+      state.lastSummary.excel = state.excelRows.length;
+      persistImportedData('excel');
+      analyzeCorrespondences(false);
+    } catch (error) {
+      log('error', null, `Import Excel impossible : ${error.message}`);
+    }
+    renderSummary();
+  }
+
+  async function readExcelWorkbook(file) {
+    if (!window.XLSX) throw new Error('SheetJS XLSX non chargé.');
+    const data = await file.arrayBuffer();
+    const workbook = XLSX.read(data, { type: 'array', cellDates: true });
+    const sheetName = workbook.SheetNames[0];
+    if (!sheetName) throw new Error('Aucune feuille Excel trouvée.');
+    return XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: '', raw: true });
+  }
+
+  function normalizeExcelRows(rows) {
+    return (rows || []).map((row) => {
+      const lieu = String(row[findColumn(row, COLUMN_NAMES.lieu)] || '').trim();
+      const rne = normalizeRne(row[findColumn(row, COLUMN_NAMES.rne)] || extractRneFromText(lieu));
+      return {
+        dispositifCode: cleanCode(row[findColumn(row, COLUMN_NAMES.dispositif)]),
+        moduleCode: cleanCode(row[findColumn(row, COLUMN_NAMES.module)]),
+        lieu,
+        rne,
+        territoireCode: normalizeTerritoireCode(row[findColumn(row, COLUMN_NAMES.territoire)] || departmentFromRne(rne)),
+        groupId: cleanCode(row[findColumn(row, COLUMN_NAMES.groupId)]),
+        sessionLabel: cleanCode(row[findColumn(row, COLUMN_NAMES.sessionLabel)]),
+        modalite: stringifyCell(row[findColumn(row, COLUMN_NAMES.modalite)]),
+        sessionStartRaw: row[findColumn(row, COLUMN_NAMES.sessionStart)],
+        sessionEndRaw: row[findColumn(row, COLUMN_NAMES.sessionEnd)],
+        sessionStartDateTime: toDisplayDateTime(row[findColumn(row, COLUMN_NAMES.sessionStart)]),
+        sessionEndDateTime: toDisplayDateTime(row[findColumn(row, COLUMN_NAMES.sessionEnd)]),
+        publicationStartDate: toInputDate(row[findColumn(row, COLUMN_NAMES.start)]),
+        publicationEndDate: toInputDate(row[findColumn(row, COLUMN_NAMES.end)]),
+        preinscriptionLink: String(row[findColumn(row, COLUMN_NAMES.link)] || '').trim(),
+        preinscritsTotal: stringifyCell(row[findColumn(row, COLUMN_NAMES.total)]),
+        preinscritsMax: stringifyCell(row[findColumn(row, COLUMN_NAMES.max)]),
+        raw: row
+      };
+    }).filter((row) => row.dispositifCode || row.moduleCode);
+  }
+
+  function findColumn(row, possibleNames) {
+    const keys = Object.keys(row || {});
+    const normalizedTargets = possibleNames.map(normalizeColumnName);
+    let key = keys.find((k) => normalizedTargets.includes(normalizeColumnName(k)));
+    if (key) return key;
+
+    key = keys.find((k) => {
+      const normalizedKey = normalizeColumnName(k);
+      return normalizedTargets.some((target) => normalizedKey.includes(target) || (normalizedKey.length >= 8 && target.includes(normalizedKey)));
+    });
+    return key || possibleNames[0];
+  }
+
+  function buildExcelIndex(rows) {
+    const index = new Map();
+    for (const row of rows || []) {
+      const key = makeMappingKey(row.dispositifCode, row.moduleCode);
+      if (!key) continue;
+      if (!index.has(key)) index.set(key, []);
+      index.get(key).push(row);
+    }
+    for (const [key, matches] of index.entries()) {
+      if (matches.length > 1) log('warning', null, `Doublon Excel pour ${key} : ${matches.length} lignes. La première sera utilisée par défaut.`);
+    }
+    return index;
+  }
+
+  /***************************************************************************
+   * CORRESPONDANCES ET VALIDATION
+   ***************************************************************************/
+  function makeMappingKey(dispositifCode, moduleCode) {
+    const d = cleanCode(dispositifCode);
+    if (!d) return '';
+    if (CONFIG.MATCH_EXCEL_BY_DISPOSITIF_ONLY) return d;
+    const m = cleanCode(moduleCode);
+    return d && m ? `${d}::${m}` : '';
+  }
+
+  function enrichMappingWithExcelData(mappingItems, excelIndex) {
+    return (mappingItems || []).map((item) => {
+      const key = makeMappingKey(item.dispositifCode, item.moduleCode);
+      const matches = excelIndex.get(key) || [];
+      const excelData = selectExcelMatchForMappingItem(item, matches);
+      return { ...item, excelMatches: matches, excelData, valid: false, validationMessages: [] };
+    });
+  }
+
+  function selectExcelMatchForMappingItem(item, matches) {
+    if (!matches.length) return null;
+    const moduleMatches = item.moduleCode ? matches.filter((row) => row.moduleCode === item.moduleCode) : [];
+    const candidateMatches = moduleMatches.length ? moduleMatches : matches;
+    const scored = candidateMatches.map((row, index) => ({ row, index, score: scoreExcelMatch(item, row) }))
+      .sort((a, b) => b.score - a.score || a.index - b.index);
+    const selected = scored[0]?.row || matches[0];
+    return buildExcelDataWithGroupSessions(selected, candidateMatches, item);
+  }
+
+  function buildExcelDataWithGroupSessions(selected, matches, item) {
+    const sessions = matches.filter((row) => isSamePlanSessionGroup(selected, row, item))
+      .sort((a, b) => compareSessionRows(a, b));
+    const orderedSessions = sessions.length ? sessions : [selected];
+    const firstWithLink = orderedSessions.find((row) => row.preinscriptionLink) || selected;
+    const firstWithPublicationStart = orderedSessions.find((row) => row.publicationStartDate) || selected;
+    const firstWithPublicationEnd = orderedSessions.find((row) => row.publicationEndDate) || selected;
+    const firstWithTotal = orderedSessions.find((row) => row.preinscritsTotal !== '') || selected;
+    const firstWithMax = orderedSessions.find((row) => row.preinscritsMax !== '') || selected;
+
+    return {
+      ...selected,
+      preinscriptionLink: firstWithLink.preinscriptionLink || selected.preinscriptionLink,
+      publicationStartDate: firstWithPublicationStart.publicationStartDate || selected.publicationStartDate,
+      publicationEndDate: firstWithPublicationEnd.publicationEndDate || selected.publicationEndDate,
+      preinscritsTotal: firstWithTotal.preinscritsTotal,
+      preinscritsMax: firstWithMax.preinscritsMax,
+      sessions: orderedSessions
+    };
+  }
+
+  function isSamePlanSessionGroup(selected, row, item) {
+    if (selected.groupId && row.groupId) return selected.groupId === row.groupId;
+    if (item.planSessionGroupId && row.groupId) return item.planSessionGroupId === row.groupId;
+    if (item.rne && row.rne) return item.rne === row.rne;
+    if (selected.rne && row.rne) return selected.rne === row.rne;
+    if (item.territoireCode && row.territoireCode) return item.territoireCode === row.territoireCode;
+    return row === selected;
+  }
+
+  function compareSessionRows(a, b) {
+    const aTime = parseExcelDate(a.sessionStartRaw)?.getTime() || Number.MAX_SAFE_INTEGER;
+    const bTime = parseExcelDate(b.sessionStartRaw)?.getTime() || Number.MAX_SAFE_INTEGER;
+    if (aTime !== bTime) return aTime - bTime;
+    return String(a.sessionLabel || '').localeCompare(String(b.sessionLabel || ''), 'fr', { numeric: true });
+  }
+
+  function scoreExcelMatch(item, row) {
+    let score = 0;
+    if (item.rne && row.rne && item.rne === row.rne) score += 100;
+    if (item.territoireCode && row.territoireCode && item.territoireCode === row.territoireCode) score += 30;
+    if (item.planSessionGroupId && row.groupId && item.planSessionGroupId === row.groupId) score += 20;
+    if (item.planSessionLabel && row.sessionLabel && item.planSessionLabel === row.sessionLabel) score += 15;
+    if (item.moduleCode && row.moduleCode && item.moduleCode === row.moduleCode) score += 5;
+    return score;
+  }
+
+  function analyzeCorrespondences(verbose = true) {
+    state.enrichedItems = enrichMappingWithExcelData(state.mappingItems, state.excelIndex);
+    state.validationErrors = [];
+    let matches = 0;
+
+    for (const item of state.enrichedItems) {
+      const errors = validateItem(item);
+      item.validationMessages = errors;
+      item.valid = errors.length === 0;
+      if (item.excelData) matches += 1;
+      errors.forEach((message) => state.validationErrors.push({ item, message }));
+      if (!item.excelData && item.dispositifCode && item.moduleCode) log('error', item, 'Aucune ligne Excel correspondante : parcours ignoré.');
+      if (item.excelMatches?.length > 1) log('warning', item, `Plusieurs lignes Excel (${item.excelMatches.length}) pour ce dispositif/module : sélection via RNE/territoire du mapping (${item.rne || item.territoireCode || 'aucune clé'}).`);
+    }
+
+    state.lastSummary = {
+      mapping: state.mappingItems.length,
+      excel: state.excelRows.length,
+      matches,
+      errors: state.validationErrors.length
+    };
+    renderSummary();
+    renderErrors();
+    if (verbose) {
+      const validCount = state.enrichedItems.filter((item) => item.valid).length;
+      const msg = `Analyse terminée : ${matches} correspondance(s) via Dispositif : code, ${validCount} ligne(s) valide(s), ${state.validationErrors.length} erreur(s).`;
+      setAlert(msg);
+      log(validCount ? 'success' : 'warning', null, msg);
+    }
+  }
+
+  function validateItem(item) {
+    const errors = [];
+    const data = item.excelData;
+    if (!item.drupalParcoursId) errors.push('ID parcours Drupal manquant.');
+    if (!item.dispositifCode) errors.push('Code dispositif manquant.');
+    if (!CONFIG.MATCH_EXCEL_BY_DISPOSITIF_ONLY && !item.moduleCode) errors.push('Code module manquant.');
+    if (!data) errors.push('Correspondance Excel introuvable via la colonne Excel "Dispositif : code".');
+    if (data) {
+      if (!data.preinscriptionLink) errors.push('Lien de préinscription manquant.');
+      if (!data.publicationStartDate) errors.push('Date de début de publication manquante/invalide.');
+      if (!data.publicationEndDate) errors.push('Date de fin de publication manquante/invalide.');
+      if (data.preinscritsTotal === '') errors.push('Nombre total de préinscrits manquant.');
+      if (data.preinscritsMax === '') errors.push('Nombre maximal de préinscrits manquant.');
+    }
+    return errors;
+  }
+
+  /***************************************************************************
+   * DATES
+   ***************************************************************************/
+  function parseExcelDate(value) {
+    if (!value && value !== 0) return null;
+    if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
+    if (typeof value === 'number') {
+      const parsed = XLSX?.SSF?.parse_date_code ? XLSX.SSF.parse_date_code(value) : null;
+      if (parsed) return new Date(Date.UTC(parsed.y, parsed.m - 1, parsed.d, parsed.H || 0, parsed.M || 0, Math.floor(parsed.S || 0)));
+      return new Date(Math.round((value - 25569) * 86400 * 1000));
+    }
+    const text = String(value).trim().replace(/\s+/g, ' ');
+    if (!text) return null;
+    let match = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T]+(\d{1,2})[:h](\d{2})(?::(\d{2}))?)?/);
+    if (match) return new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4] || 0), Number(match[5] || 0), Number(match[6] || 0)));
+    match = text.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})(?:[ T]+(\d{1,2})[:h](\d{2})(?::(\d{2}))?)?/);
+    if (match) return new Date(Date.UTC(Number(match[3]), Number(match[2]) - 1, Number(match[1]), Number(match[4] || 0), Number(match[5] || 0), Number(match[6] || 0)));
+    const date = new Date(text);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  function toInputDate(value) {
+    const date = parseExcelDate(value);
+    if (!date) return '';
+    const y = date.getUTCFullYear();
+    const m = String(date.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(date.getUTCDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+
+  function toDisplayDateTime(value) {
+    if (!value && value !== 0) return '';
+    if (typeof value === 'string') {
+      const trimmed = value.trim().replace(/\s+/g, ' ');
+      if (!trimmed) return '';
+      const fr = trimmed.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})(?:[ T]+(\d{1,2})[:h](\d{2})(?::(\d{2}))?)?/);
+      if (fr) return `${fr[1].padStart(2, '0')}/${fr[2].padStart(2, '0')}/${fr[3]}${fr[4] ? ` à ${fr[4].padStart(2, '0')}:${fr[5]}${fr[6] ? `:${fr[6].padStart(2, '0')}` : ''}` : ''}`;
+    }
+    const date = parseExcelDate(value);
+    if (!date) return stringifyCell(value);
+    const day = String(date.getUTCDate()).padStart(2, '0');
+    const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+    const year = date.getUTCFullYear();
+    const hours = String(date.getUTCHours()).padStart(2, '0');
+    const minutes = String(date.getUTCMinutes()).padStart(2, '0');
+    const seconds = String(date.getUTCSeconds()).padStart(2, '0');
+    const hasTime = date.getUTCHours() || date.getUTCMinutes() || date.getUTCSeconds();
+    return `${day}/${month}/${year}${hasTime ? ` à ${hours}:${minutes}${date.getUTCSeconds() ? `:${seconds}` : ''}` : ''}`;
+  }
+
+  function addDaysToInputDate(date, days) {
+    const parsed = parseExcelDate(date);
+    if (!parsed) return '';
+    parsed.setUTCDate(parsed.getUTCDate() + Number(days || 0));
+    return toInputDate(parsed);
+  }
+
+  /***************************************************************************
+   * BOUCLE DE TRAITEMENT
+   ***************************************************************************/
+  async function runUpdateBatch() {
+    if (state.running) return;
+    const existingBatch = readBatchState();
+    if (existingBatch.active) {
+      log('info', null, `Reprise du batch existant à l'étape ${existingBatch.phase}, élément ${Number(existingBatch.index || 0) + 1}.`);
+      await runPersistedBatchStep();
+      return;
+    }
+    analyzeCorrespondences(false);
+    const validItems = state.enrichedItems.filter((item) => item.valid);
+    if (!state.mappingItems.length || !state.excelRows.length || !validItems.length) {
+      setAlert('Impossible de démarrer : importez les fichiers et conservez au moins une ligne valide.');
+      log('error', null, 'Contrôles avant lancement non satisfaits.');
+      return;
+    }
+
+    const summary = `Résumé avant lancement : ${validItems.length} parcours valides sur ${state.enrichedItems.length}. Correspondance Excel par colonne "Dispositif : code". Simulation=${CONFIG.DRY_RUN ? 'oui' : 'non'}, auto-save=${CONFIG.AUTO_SAVE ? 'oui' : 'non'}, validation clic=${CONFIG.SAFE_CLICK_MODE ? 'oui' : 'non'}. Continuer ?`;
+    if (!window.confirm(summary)) return;
+
+    state.updateReport = [];
+    writeStoredJson(STORAGE_KEYS.updateReport, state.updateReport);
+    writeBatchState({ active: true, index: 0, phase: 'goToAdmin', startedAt: new Date().toISOString() });
+    state.stopRequested = false;
+    log('info', null, `${summary} Le batch reprendra automatiquement après chaque changement de page Drupal.`);
+    await runPersistedBatchStep();
+  }
+
+  function scheduleAutoResumeBatch() {
+    const batch = readBatchState();
+    if (!batch.active) return;
+    setStatus('Batch détecté : reprise automatique…');
+    setAlert('Batch en cours restauré : reprise automatique, pas besoin de recliquer sur Démarrer.');
+    window.setTimeout(() => runPersistedBatchStep(), 900);
+  }
+
+  async function runPersistedBatchStep() {
+    if (state.running) return;
+    state.running = true;
+    state.stopRequested = false;
+    setStatus('Traitement en cours…');
+
+    try {
+      while (!state.stopRequested) {
+        analyzeCorrespondences(false);
+        const validItems = state.enrichedItems.filter((item) => item.valid);
+        const batch = readBatchState();
+
+        if (!batch.active) break;
+        if (batch.index >= validItems.length) {
+          clearBatchState();
+          setStatus('Terminé.');
+          log('success', null, 'Batch terminé.');
+          break;
+        }
+
+        const item = validItems[batch.index];
+        const phase = batch.phase || 'goToAdmin';
+        log('info', item, `Reprise batch automatique : élément ${batch.index + 1}/${validItems.length}, étape ${phase}.`);
+
+        try {
+          if (phase === 'goToAdmin') {
+            writeBatchState({ ...batch, phase: 'filter' });
+            await goToAdminContent();
+            continue;
+          }
+
+          if (phase === 'filter') {
+            // Important : le clic sur "Filtrer" peut recharger immédiatement la page.
+            // On mémorise donc l'étape suivante AVANT le clic pour éviter de recliquer
+            // en boucle sur Filtrer après le rechargement de /admin/content.
+            writeBatchState({ ...batch, phase: 'openResult' });
+            await filterByDrupalId(item.drupalParcoursId);
+            continue;
+          }
+
+          if (phase === 'openResult') {
+            writeBatchState({ ...batch, phase: 'updatePage' });
+            await openFirstResult(item);
+            continue;
+          }
+
+          if (phase === 'updatePage') {
+            if (location.pathname.startsWith(CONFIG.ADMIN_CONTENT_URL)) {
+              // Après un rechargement, on peut revenir sur /admin/content avec l'étape updatePage déjà mémorisée.
+              // Dans ce cas il faut d'abord recliquer sur le lien du parcours, pas chercher un lien Modifier dans l'admin.
+              writeBatchState({ ...batch, phase: 'openResult' });
+              continue;
+            }
+            const readyToEdit = await ensureEditPage();
+            if (!readyToEdit) return;
+            await updateCurrentDrupalPage(item, item.excelData);
+            const nextIndex = Number(batch.index || 0) + 1;
+            const hasMoreItems = nextIndex < validItems.length;
+
+            // Le clic Enregistrer peut recharger immédiatement la page : on persiste donc
+            // l'état suivant AVANT le clic. S'il n'y a plus rien à traiter, le batch est
+            // désactivé avant sauvegarde pour éviter toute reprise automatique après reload.
+            if (hasMoreItems) writeBatchState({ ...batch, index: nextIndex, phase: 'goToAdmin' });
+            else clearBatchState();
+
+            await saveCurrentPageIfAllowed(item);
+            log('success', item, 'Traitement terminé pour ce parcours.');
+
+            if (!hasMoreItems) {
+              setStatus('Terminé.');
+              setAlert('Dernier parcours traité : le batch est terminé et ne reprendra pas après l’enregistrement.');
+              log('success', null, 'Batch terminé : aucun autre parcours à mettre à jour.');
+              break;
+            }
+
+            await sleep(CONFIG.DELAY_BETWEEN_ACTIONS);
+            continue;
+          }
+
+          writeBatchState({ ...batch, phase: 'goToAdmin' });
+        } catch (error) {
+          if (isClickCancelledError(error)) {
+            setStatus('En pause : clic annulé.');
+            setAlert('Clic annulé : le batch reste positionné sur cette étape. Relancez avec Démarrer ou rechargez la page pour reprendre.');
+            log('warning', item, `Batch mis en pause sans passer au parcours suivant : ${error.message}`);
+            return;
+          }
+          log('error', item, `Erreur parcours : ${error.message}. Contexte : ${captureTextContext()}`);
+          writeBatchState({ ...batch, index: batch.index + 1, phase: 'goToAdmin' });
+          await sleep(CONFIG.DELAY_BETWEEN_ACTIONS);
+        }
+      }
+    } finally {
+      state.running = false;
+      if (state.stopRequested) {
+        clearBatchState();
+        setStatus('Arrêté.');
+        log('warning', null, 'Batch interrompu proprement.');
+      }
+    }
+  }
+
+  function readBatchState() {
+    return readStoredJson(STORAGE_KEYS.batchState, { active: false, index: 0, phase: 'goToAdmin' }) || { active: false, index: 0, phase: 'goToAdmin' };
+  }
+
+  function writeBatchState(batchState) {
+    writeStoredJson(STORAGE_KEYS.batchState, batchState);
+  }
+
+  function clearBatchState() {
+    writeBatchState({ active: false, index: 0, phase: 'goToAdmin' });
+  }
+
+  function isClickCancelledError(error) {
+    return /Clic annulé par l’utilisateur/i.test(String(error?.message || error || ''));
+  }
+
+  async function processOneMappingItem(item) {
+    log('info', item, `Démarrage parcours Drupal ${item.drupalParcoursId}.`);
+    await goToAdminContent();
+    await filterByDrupalId(item.drupalParcoursId);
+    await openFirstResult(item);
+    await updateCurrentDrupalPage(item, item.excelData);
+    await saveCurrentPageIfAllowed(item);
+  }
+
+  async function goToAdminContent() {
+    if (!location.pathname.startsWith(CONFIG.ADMIN_CONTENT_URL)) {
+      const menu = await waitForAnySelector(SELECTORS.adminMenu, 3000).catch(() => null);
+      if (menu) await clickElement(menu, 'Ouvrir le menu d’administration');
+      const link = await waitForAnySelector(SELECTORS.contentLink, 3000).catch(() => null);
+      if (link) {
+        await clickElement(link, 'Ouvrir la page Contenu');
+        await waitForLocation(CONFIG.ADMIN_CONTENT_URL);
+      } else {
+        location.href = CONFIG.ADMIN_CONTENT_URL;
+        await waitForLocation(CONFIG.ADMIN_CONTENT_URL);
+      }
+    }
+    await waitForAnySelector(SELECTORS.nidFilter, CONFIG.MAX_WAIT_TIME);
+  }
+
+  async function filterByDrupalId(drupalParcoursId) {
+    const input = await waitForAnySelector(SELECTORS.nidFilter, CONFIG.MAX_WAIT_TIME);
+    setInputValue(input, drupalParcoursId);
+    const button = await waitForAnySelector(SELECTORS.filterButton, CONFIG.MAX_WAIT_TIME);
+    await clickElement(button, `Filtrer par ID Drupal ${drupalParcoursId}`);
+    await sleep(1000);
+  }
+
+  function getFirstResultTitleLink() {
+    // Ciblage explicite demandé : cliquer sur le premier <a href="/formation/...">
+    // contenu dans la cellule titre Drupal :
+    // <td headers="view-title-table-column" class="views-field views-field-title">...
+    const exactFirstRowLink = document.querySelector('table.views-table tbody tr:first-child td[headers="view-title-table-column"].views-field-title > a[href^="/formation/"]')
+      || document.querySelector('table.views-table tbody tr:first-child td[headers="view-title-table-column"].views-field-title > a[href]');
+    if (exactFirstRowLink) return exactFirstRowLink;
+
+    const titleCells = Array.from(document.querySelectorAll('td[headers="view-title-table-column"].views-field-title, td[headers="view-title-table-column"]'));
+    for (const cell of titleCells) {
+      const firstLink = cell.querySelector('a[href^="/formation/"]') || cell.querySelector('a[href]');
+      if (firstLink) return firstLink;
+    }
+
+    return findElementBySelectors(SELECTORS.resultTitleLink);
+  }
+
+  async function openFirstResult(item) {
+    const link = await waitForFunction(getFirstResultTitleLink, CONFIG.MAX_WAIT_TIME, 'Lien du premier résultat dans la colonne titre introuvable.');
+    const row = link.closest('tr');
+    if (row && !row.textContent.includes(item.drupalParcoursId)) log('warning', item, 'Le premier résultat ne contient pas clairement l’ID filtré dans la ligne.');
+    log('info', item, `Ouverture du résultat : ${normalizeText(link.textContent).slice(0, 120)}`);
+    await clickElement(link, 'Ouvrir le premier résultat Drupal');
+    await sleep(1000);
+
+    const editLink = findElementBySelectors(SELECTORS.editLinks);
+    if (editLink && !/\/edit(?:$|[?#])/.test(location.pathname + location.search)) {
+      await clickElement(editLink, 'Ouvrir la page de modification');
+      await sleep(1000);
+    }
+  }
+
+  async function ensureEditPage() {
+    if (/\/edit(?:$|[?#])/.test(location.pathname + location.search)) return true;
+    if (findElementBySelectors(SELECTORS.startDate)) return true;
+    if (location.pathname.startsWith(CONFIG.ADMIN_CONTENT_URL)) return false;
+
+    const editLink = await waitForFunction(() => findElementBySelectors(SELECTORS.editLinks), 4000, 'Lien Modifier introuvable sur la page formation.').catch(() => null);
+    if (!editLink) throw new Error('Page de modification introuvable : aucun lien Modifier ni champ date détecté.');
+    await clickElement(editLink, 'Ouvrir la page de modification');
+    await sleep(1000);
+    return /\/edit(?:$|[?#])/.test(location.pathname + location.search) || Boolean(findElementBySelectors(SELECTORS.startDate));
+  }
+
+  async function clickFormationBodyEditBeforeRichText(item) {
+    const editButton = await waitForAnySelector(SELECTORS.formationBodyEdit, 5000).catch(() => null);
+    if (!editButton) {
+      log('warning', item, 'Bouton Modifier du paragraphe formation body introuvable avant modification du texte riche.');
+      return;
+    }
+
+    await clickElement(editButton, 'Cliquer sur Modifier du paragraphe formation body avant modification du texte riche');
+    await sleep(1500);
+    log('success', item, 'Bouton Modifier du paragraphe formation body cliqué avant modification du texte riche.');
+  }
+
+  async function updateCurrentDrupalPage(item, data) {
+    const startDate = data.publicationStartDate;
+    const endDate = data.publicationEndDate;
+    const unpublishDate = addDaysToInputDate(endDate, 1);
+
+    setInputValue(await waitForAnySelector(SELECTORS.startDate, CONFIG.MAX_WAIT_TIME), startDate);
+    setInputValue(await waitForAnySelector(SELECTORS.endDate, CONFIG.MAX_WAIT_TIME), endDate);
+    setInputValue(await waitForAnySelector(SELECTORS.unpublishDate, CONFIG.MAX_WAIT_TIME), unpublishDate);
+    log('success', item, `Dates mises à jour : début=${startDate}, fin=${endDate}, dépublication=${unpublishDate}.`);
+
+    await clickFormationBodyEditBeforeRichText(item);
+
+    const formatSelect = await waitForAnySelector(SELECTORS.textFormat, CONFIG.MAX_WAIT_TIME).catch(() => null);
+    if (formatSelect) {
+      setSelectValue(formatSelect, CONFIG.ADVANCED_FORMAT_VALUE);
+      log('success', item, 'Formatage avancé sélectionné.');
+      await sleep(1200);
+    } else {
+      log('warning', item, 'Select de format texte introuvable : poursuite du traitement.');
+    }
+
+    await openCkEditorSource();
+    const currentHtml = await getCurrentHtmlFromEditor();
+    const newHtml = updateFormationHtml(currentHtml, data);
+    await setHtmlInEditor(newHtml);
+    log('success', item, 'HTML éditorial mis à jour sans insertion de codes Sofia-FMO/GAIA.');
+
+    const existingCallout = findExistingCalloutParagraph();
+    if (existingCallout) {
+      log('success', item, 'Mise en avant déjà présente : aucune nouvelle mise en avant ajoutée, contenu conservé.');
+    } else {
+      log('info', item, 'Aucune mise en avant existante détectée : création du paragraphe avant tout enregistrement.');
+      await createCallout(data);
+      // addCalloutParagraph() a déjà renseigné le CTA, le format avancé, la source et la couleur.
+      // Ne pas rappeler setCalloutSourceToBr() ici : un second clic sur Source peut refermer l'éditeur
+      // et empêcher le clic final sur Enregistrer.
+      if (!findExistingCalloutParagraph()) {
+        throw new Error('La mise en avant n’a pas été détectée après création : enregistrement annulé pour éviter une page incomplète.');
+      }
+      log('success', item, 'Mise en avant de préinscription créée et vérifiée.');
+    }
+
+    recordUpdateReport(item, data, { startDate, endDate, unpublishDate });
+  }
+
+  async function saveCurrentPageIfAllowed(item) {
+    if (CONFIG.DRY_RUN || !CONFIG.AUTO_SAVE) {
+      const msg = 'Page modifiée en mode simulation ou sans sauvegarde automatique. Vérifiez puis enregistrez manuellement.';
+      setAlert(msg);
+      log('warning', item, msg);
+      return;
+    }
+
+    // Sécurité de séquence : le bouton Drupal "Enregistrer" ne doit être cliqué
+    // qu'après toutes les modifications (dates, texte riche, mise en avant, couleur).
+    await waitForAjax();
+    await sleep(CONFIG.DELAY_BETWEEN_ACTIONS);
+    log('info', item, 'Toutes les modifications sont terminées : clic final sur Enregistrer autorisé.');
+
+    const save = await waitForFunction(findFinalSaveButton, CONFIG.MAX_WAIT_TIME, 'Bouton final Enregistrer introuvable.');
+    await clickElement(save, 'Enregistrer la page Drupal en tout dernier');
+    await sleep(1500);
+  }
+
+  function findFinalSaveButton() {
+    return findElementBySelectors(SELECTORS.save);
+  }
+
+  async function goNext() {
+    await sleep(CONFIG.DELAY_BETWEEN_ACTIONS);
+  }
+
+  /***************************************************************************
+   * CKEDITOR 5 / SOURCE
+   ***************************************************************************/
+  async function openCkEditorSource() {
+    const existing = getCkEditorSourceElement();
+    if (existing) return existing;
+    const sourceButton = await waitForAnySelector(SELECTORS.ckSourceButton, CONFIG.MAX_WAIT_TIME);
+    await clickElement(sourceButton, 'Ouvrir la source CKEditor');
+    return waitForFunction(getCkEditorSourceElement, CONFIG.MAX_WAIT_TIME, 'Source CKEditor introuvable.');
+  }
+
+  function getCkEditorSourceElement() {
+    return SELECTORS.ckSourceArea.map((selector) => Array.from(document.querySelectorAll(selector)).find(isVisible)).find(Boolean) || null;
+  }
+
+  async function getCurrentHtmlFromEditor() {
+    const source = getCkEditorSourceElement() || await openCkEditorSource();
+    if ('value' in source) return source.value || '';
+    return source.textContent || source.innerHTML || '';
+  }
+
+  async function setHtmlInEditor(html) {
+    const source = getCkEditorSourceElement() || await openCkEditorSource();
+    if ('value' in source) source.value = html;
+    else source.textContent = html;
+    dispatchAllEvents(source);
+  }
+
+  /***************************************************************************
+   * MISE À JOUR HTML ÉDITORIAL
+   ***************************************************************************/
+  function updateFormationHtml(html, data) {
+    let output = String(html || '');
+    output = removeExistingLieuSection(output);
+    output = removeExistingPlacesLine(output);
+    output = removeExistingSessionParagraphs(output);
+    output = upsertMiseEnPlaceFormationDetails(output, data);
+    return cleanHtml(output);
+  }
+
+  function upsertMiseEnPlaceFormationDetails(html, data) {
+    const sessions = data.sessions?.length ? data.sessions : [data];
+    const sessionParagraphs = buildSessionParagraphs(sessions);
+    const placesItem = buildPlacesListItem(data.preinscritsTotal, data.preinscritsMax);
+    const lieuxItem = buildLieuxDatesListItem();
+    const generatedListItems = `${placesItem}\n    ${lieuxItem}`;
+    const miseEnPlaceRegex = /(<h3[^>]*>\s*Mise en place de la formation(?:&nbsp;|\s)*<\/h3>\s*<ul[^>]*>)([\s\S]*?)(<\/ul>)/i;
+
+    if (miseEnPlaceRegex.test(html)) {
+      return html.replace(miseEnPlaceRegex, (match, beforeList, listContent, afterList) => {
+        const cleanedList = removeGeneratedMiseEnPlaceItems(listContent).trimEnd();
+        return `${beforeList}${cleanedList}\n    ${generatedListItems}\n${afterList}\n${sessionParagraphs}`;
+      });
+    }
+
+    const section = `<h3>Mise en place de la formation&nbsp;</h3>\n<ul>\n    ${generatedListItems}\n</ul>\n${sessionParagraphs}`;
+    const contactRegex = /<h3[^>]*>\s*Contact de la formation\s*<\/h3>/i;
+    const preinscriptionRegex = /<h3[^>]*>\s*Préinscription\s*<\/h3>|<h3[^>]*>\s*Preinscription\s*<\/h3>/i;
+    if (contactRegex.test(html)) return html.replace(contactRegex, `${section}\n$&`);
+    if (preinscriptionRegex.test(html)) return html.replace(preinscriptionRegex, `${section}\n$&`);
+    return `${html.trim()}\n${section}`;
+  }
+
+  function buildPlacesListItem(total, max) {
+    const remaining = calculateRemainingPlaces(total, max);
+    return `<li>
+        <strong>Nombre de places restantes :</strong> ${escapeHtml(remaining)}
+    </li>`;
+  }
+
+  function calculateRemainingPlaces(total, max) {
+    const registered = parseNumberCell(total);
+    const capacity = parseNumberCell(max);
+    if (registered == null || capacity == null) return '';
+    return String(Math.max(capacity - registered, 0));
+  }
+
+  function parseNumberCell(value) {
+    if (value == null || value === '') return null;
+    const normalized = String(value).replace(/\s+/g, '').replace(',', '.');
+    const match = normalized.match(/-?\d+(?:\.\d+)?/);
+    if (!match) return null;
+    const parsed = Number(match[0]);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function buildLieuxDatesListItem() {
+    return `<li class="ck-list-marker-bold">\n        <strong>Lieux et dates de la formation :&nbsp;</strong>\n    </li>`;
+  }
+
+  function buildSessionParagraphs(sessions) {
+    return (sessions || [])
+      .map((session, index) => formatSessionParagraph(session, index + 1))
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  function formatSessionParagraph(session, number) {
+    const modalite = escapeHtml(session.modalite || '');
+    const start = escapeHtml(session.sessionStartDateTime || toDisplayDateTime(session.sessionStartRaw));
+    const end = escapeHtml(session.sessionEndDateTime || toDisplayDateTime(session.sessionEndRaw));
+    const lieu = escapeHtml(session.lieu || '');
+    return `<p>\n    Session ${number}<br>\n    Modalité : ${modalite}<br>\n    Date et heure : Du ${start} au ${end}<br>\n    Lieu : ${lieu}\n</p>`;
+  }
+
+  function removeGeneratedMiseEnPlaceItems(listHtml) {
+    return String(listHtml || '')
+      .replace(/<li[^>]*>[\s\S]*?<strong>\s*(?:Nombre de place restante|Nombre de places restantes|Nombre de personne inscrite par rapport au nombre maximal de stagiaires)\s*:?[\s\S]*?<\/li>\s*/gi, '')
+      .replace(/<li[^>]*>[\s\S]*?<strong>\s*(?:Lieux? et dates de la formation|Lieu et dates de la formation)\s*:?(?:&nbsp;)?[\s\S]*?<\/li>\s*/gi, '');
+  }
+
+  function removeExistingLieuSection(html) {
+    let output = String(html || '');
+    output = output.replace(/<h3[^>]*>\s*Lieu et dates de la formation\s*<\/h3>\s*(?:<p[^>]*>.*?<\/p>\s*)+/gis, '');
+    output = output.replace(/<h3[^>]*>\s*Lieux et dates de la formation\s*<\/h3>\s*(?:<p[^>]*>.*?<\/p>\s*)+/gis, '');
+    output = output.replace(/<h3[^>]*>\s*Lieu de la formation\s*<\/h3>\s*<p[^>]*>.*?<\/p>\s*/gis, '');
+    output = output.replace(/<h3[^>]*>\s*Lieu\s*de\s*la\s*formation\s*<\/h3>\s*/gis, '');
+    return output;
+  }
+
+  function removeExistingPlacesLine(html) {
+    return String(html || '')
+      .replace(/<p[^>]*>\s*Nombre de place restante\s*:\s*.*?<\/p>\s*/gis, '')
+      .replace(/<p[^>]*>\s*Nombre de places restantes\s*:\s*.*?<\/p>\s*/gis, '')
+      .replace(/<p[^>]*>\s*Nombre de personne inscrite par rapport au nombre maximal de stagiaires\s*:\s*.*?<\/p>\s*/gis, '');
+  }
+
+  function removeExistingSessionParagraphs(html) {
+    return String(html || '').replace(/<p[^>]*>\s*Session\s+\d+\s*<br\s*\/?>(?:.|\n)*?<\/p>\s*/gis, '');
+  }
+
+  function cleanHtml(html) {
+    return String(html || '').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  /***************************************************************************
+   * PARAGRAPHE CALLOUT
+   ***************************************************************************/
+  async function addCalloutParagraph(data) {
+    // Flux demandé : après modification du texte riche principal, ouvrir l'ajout de paragraphe,
+    // choisir "Mise en avant" via l'overlay, renseigner CTA, format avancé, source <h2>Préinscriptions</h2>, couleur.
+    const addButton = await waitForAnySelector(SELECTORS.addParagraph, CONFIG.MAX_WAIT_TIME);
+    await clickElement(addButton, 'Ajouter Paragraphe');
+    await waitForAjax();
+
+    const miseEnAvantChoice = await waitForFunction(findMiseEnAvantChoiceElement, 12000, 'Choix Mise en avant introuvable.');
+    await clickElement(miseEnAvantChoice, 'Choisir Mise en avant');
+    await waitForAjax();
+
+    let titleReady = await waitForAnySelector(SELECTORS.calloutTitle, 3000).catch(() => null);
+    if (!titleReady) {
+      const iconFallback = findCalloutIcon();
+      if (iconFallback && iconFallback !== miseEnAvantChoice) {
+        await clickElement(iconFallback, 'Choisir Mise en avant via icône callout');
+        await waitForAjax();
+        titleReady = await waitForAnySelector(SELECTORS.calloutTitle, 3000).catch(() => null);
+      }
+    }
+
+    if (!titleReady) await waitForAnySelector(SELECTORS.calloutTitle, 12000);
+    fillCalloutFields(document, data);
+    await setCalloutContentFormatAdvanced(document);
+    await setCalloutSourceToBr(document);
+    await setCalloutColor(document);
+  }
+
+  function findMiseEnAvantChoiceElement() {
+    // Le bon choix de paragraphe est le bouton "Mise en avant" ajouté par Drupal.
+    // Si Drupal ne déclenche pas le bouton parent, on accepte aussi l'icône callout fournie.
+    return findCalloutButton() || findCalloutIcon();
+  }
+
+  function findCalloutButton() {
+    const selectorCandidates = SELECTORS.calloutButton
+      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+      .filter((element, index, list) => list.indexOf(element) === index)
+      .filter((element) => isClickableVisible(element) && isCalloutButton(element));
+
+    const exactDrupalButton = selectorCandidates.find((element) => element.matches('button[name="field_formation_body_callout_add_more"], button[data-drupal-selector^="field-formation-body-callout-add-more"]'));
+    if (exactDrupalButton) return exactDrupalButton;
+    if (selectorCandidates.length) return selectorCandidates[0];
+
+    const labeledButton = Array.from(document.querySelectorAll('button, input[type="submit"], a, [role="button"]'))
+      .find((el) => isClickableVisible(el) && isCalloutButton(el));
+    if (labeledButton) return labeledButton;
+
+    const icon = findCalloutIcon();
+    const iconButton = icon?.closest('button, input[type="submit"], a, [role="button"]');
+    if (iconButton && isClickableVisible(iconButton) && isCalloutButton(iconButton)) return iconButton;
+
+    return icon;
+  }
+
+  function findCalloutIcon() {
+    const icon = SELECTORS.calloutIcon
+      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+      .find((element) => isClickableVisible(element));
+    if (icon) return icon;
+
+    const overlay = SELECTORS.calloutOverlay
+      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+      .find((element) => isClickableVisible(element));
+    const overlayIcon = overlay?.closest('.paragraphs-button--icon');
+    if (overlayIcon && isClickableVisible(overlayIcon) && /callout-default-icon/i.test(overlayIcon.getAttribute('style') || '')) return overlayIcon;
+
+    return null;
+  }
+
+  function isCalloutButton(element) {
+    const descriptor = normalizeText(`${element.textContent || ''} ${element.value || ''} ${element.name || ''} ${element.title || ''} ${element.getAttribute('aria-label') || ''} ${element.getAttribute('data-drupal-selector') || ''} ${element.className || ''}`);
+    const isAddMoreButton = /field[_-]formation[_-]body[_-]callout[_-]add[_-]more|paragraphs[_-]button[_-]*add[_-]more/i.test(descriptor);
+    return descriptor.includes('mise en avant') && (descriptor.includes('callout') || isAddMoreButton || descriptor.includes('paragraphs-button--add-more'));
+  }
+
+  function findExistingCalloutParagraph() {
+    // Important : ne jamais considérer le bouton "Ajouter Paragraphe" ou la carte de choix
+    // "Mise en avant" comme un paragraphe déjà créé. On accepte uniquement :
+    // 1) un vrai champ de sous-formulaire callout ouvert ;
+    // 2) une ligne Drupal déjà créée de type paragraph-type--callout (même repliée).
+    const existingCalloutRow = Array.from(document.querySelectorAll('tr.paragraph-type--callout, tr[class*="paragraph-type--callout"]'))
+      .find((row) => {
+        if (isParagraphTypeChooser(row)) return false;
+        const hasFormationBodyWrapper = Boolean(row.querySelector('[data-drupal-selector^="edit-field-formation-body-"]'));
+        const hasCalloutType = Boolean(row.querySelector('img.paragraph-type-icon[title="Mise en avant"], img[src*="callout-default-icon"], .paragraph-type-label'));
+        const hasEditAction = Boolean(row.querySelector('input[name^="field_formation_body_"][name$="_edit"], [data-drupal-selector^="field-formation-body-"][data-drupal-selector*="-edit"]'));
+        const label = normalizeText(row.querySelector('.paragraph-type-label')?.textContent || row.textContent || '');
+        return hasFormationBodyWrapper && hasCalloutType && hasEditAction && (label.includes('mise en avant') || label.includes('callout'));
+      });
+    if (existingCalloutRow) return existingCalloutRow;
+
+    const fieldSelectors = [
+      ...SELECTORS.calloutColor,
+      ...SELECTORS.calloutUri,
+      ...SELECTORS.calloutTitle,
+      ...SELECTORS.calloutContentFormat
+    ];
+
+    for (const selector of fieldSelectors) {
+      const elements = Array.from(document.querySelectorAll(selector));
+      for (const element of elements) {
+        const signature = `${element.name || ''} ${element.getAttribute('data-drupal-selector') || ''}`;
+        if (!/field[_-]formation[_-]body|edit-field-formation-body/i.test(signature)) continue;
+        if (!/field[_-]callout|field-callout/i.test(signature)) continue;
+
+        const container = element.closest('.paragraphs-subform, .paragraph-type, .field--type-entity-reference-revisions, fieldset, details, .form-wrapper') || element.parentElement;
+        if (container && !isParagraphTypeChooser(container)) return container;
+      }
+    }
+
+    return null;
+  }
+
+  function isParagraphTypeChooser(element) {
+    const descriptor = `${element.textContent || ''} ${element.getAttribute('data-drupal-selector') || ''} ${element.className || ''}`;
+    return /paragraph-type-add|paragraphs-add-dialog|paragraphs-button|ui-dialog|choix de paragraphe/i.test(descriptor);
+  }
+
+  async function createCallout(data) {
+    await addCalloutParagraph(data);
+  }
+
+  async function ensureCalloutContentAndColor(item) {
+    await setCalloutContentFormatAdvanced(document);
+    await setCalloutSourceToBr(document);
+    await setCalloutColor(document);
+    log('success', item, 'Contenu source <h2>Préinscriptions</h2> de mise en avant et couleur Bleu cumulus vérifiés avant sauvegarde.');
+  }
+
+
+  async function setCalloutContentFormatAdvanced(scope = document) {
+    const format = await waitForFunction(
+      () => findElementBySelectors(SELECTORS.calloutContentFormat, scope) || findElementBySelectors(SELECTORS.calloutContentFormat, document),
+      10000,
+      'Select format du contenu de mise en avant introuvable.'
+    );
+    setSelectValue(format, CONFIG.ADVANCED_FORMAT_VALUE, 'Formatage avancé');
+    await waitForAjax(5000);
+  }
+
+  async function setCalloutSourceToBr(scope = document) {
+    let sourceArea = findCalloutSourceTextarea(scope);
+    if (!sourceArea) {
+      const sourceButton = await waitForFunction(
+        () => findCalloutSourceButton(scope),
+        10000,
+        'Bouton Source du contenu de mise en avant introuvable.'
+      );
+      await clickElement(sourceButton, 'Ouvrir la source de la mise en avant');
+
+      sourceArea = await waitForFunction(
+        () => findCalloutSourceTextarea(scope),
+        10000,
+        'Zone source de la mise en avant introuvable.'
+      );
+    }
+
+    setInputValue(sourceArea, CONFIG.CALLOUT_BODY_TEXT);
+  }
+
+  function findCalloutSourceButton(scope = document) {
+    const candidates = Array.from((scope || document).querySelectorAll(SELECTORS.calloutSourceButton.join(',')))
+      .map((element) => (element.matches('span.ck-button__label') ? element.closest('button') || element : element))
+      .filter((element, index, list) => element && list.indexOf(element) === index && isVisible(element))
+      .filter((element) => normalizeText(`${element.textContent || ''} ${element.getAttribute('aria-label') || ''} ${element.getAttribute('data-cke-tooltip-text') || ''}`).includes('source'));
+
+    if (!candidates.length && scope !== document) return findCalloutSourceButton(document);
+
+    const calloutScoped = candidates.filter((element) => /field[_-]callout|mise en avant|callout/i.test(`${element.closest('.paragraphs-subform, fieldset, details, .form-wrapper, .ck-editor')?.textContent || ''} ${element.closest('.paragraphs-subform, fieldset, details, .form-wrapper, .ck-editor')?.getAttribute('data-drupal-selector') || ''}`));
+    const list = calloutScoped.length ? calloutScoped : candidates;
+    return list[list.length - 1] || null;
+  }
+
+  function findCalloutSourceTextarea(scope = document) {
+    const areas = Array.from((scope || document).querySelectorAll(SELECTORS.calloutSourceTextarea.join(','))).filter(isVisible);
+    if (!areas.length && scope !== document) return findCalloutSourceTextarea(document);
+
+    const calloutScoped = areas.filter((area) => /field[_-]callout|mise en avant|callout/i.test(`${area.closest('.paragraphs-subform, fieldset, details, .form-wrapper, .ck-editor')?.textContent || ''} ${area.closest('.paragraphs-subform, fieldset, details, .form-wrapper, .ck-editor')?.getAttribute('data-drupal-selector') || ''}`));
+    const list = calloutScoped.length ? calloutScoped : areas;
+    return list[list.length - 1] || null;
+  }
+
+  async function setCalloutRichTextBody(scope = document) {
+    const editor = await waitForFunction(() => findCalloutRichTextEditor(scope), 8000, 'Éditeur riche de la mise en avant introuvable.').catch(() => null);
+    if (!editor) throw new Error('Éditeur riche de la mise en avant introuvable.');
+    setCkEditorEditableHtml(editor, `<p>${escapeHtml(CONFIG.CALLOUT_BODY_TEXT)}</p>`);
+  }
+
+  function findCalloutRichTextEditor(scope = document) {
+    const editorSelector = `.ck.ck-content.ck-editor__editable_inline[contenteditable="true"], .ck-editor__editable_inline[contenteditable="true"], div[role="textbox"][contenteditable="true"][aria-label*="Éditeur de texte enrichi"], div[role="textbox"][contenteditable="true"][aria-label*="Zone d'édition"]`;
+    const editors = Array.from(scope.querySelectorAll(editorSelector)).filter(isVisible);
+    if (!editors.length && scope !== document) return findCalloutRichTextEditor(document);
+
+    const calloutScopedEditor = editors.find((editor) => /callout|mise en avant|field_callout|field-callout/i.test(`${editor.closest('.paragraphs-subform, fieldset, details, .form-wrapper')?.textContent || ''} ${editor.closest('.paragraphs-subform, fieldset, details, .form-wrapper')?.getAttribute('data-drupal-selector') || ''}`));
+    return editors.find((editor) => editor.classList.contains('ck-focused'))
+      || calloutScopedEditor
+      || editors.find((editor) => normalizeText(editor.textContent) === '' || editor.querySelector('[data-cke-filler]'))
+      || editors[editors.length - 1]
+      || null;
+  }
+
+  function setCkEditorEditableHtml(editor, html) {
+    editor.scrollIntoView({ block: 'center', inline: 'center' });
+    editor.focus();
+    editor.innerHTML = html;
+    editor.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: CONFIG.CALLOUT_BODY_TEXT }));
+    editor.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: CONFIG.CALLOUT_BODY_TEXT }));
+    editor.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+    editor.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+
+    const editable = editor.ckeditorInstance || editor.closest('.ck-editor')?.ckeditorInstance;
+    if (editable?.setData) editable.setData(html);
+  }
+
+  async function setCalloutColor(scope = document) {
+    const color = await waitForFunction(() => findElementBySelectors(SELECTORS.calloutColor, scope) || findElementBySelectors(SELECTORS.calloutColor, document), 8000, 'Select couleur Mise en avant introuvable.');
+    setSelectValue(color, CONFIG.CALLOUT_COLOR_VALUE, 'Bleu cumulus');
+  }
+
+  function fillCalloutFields(scope, data) {
+    const uri = findElementBySelectors(SELECTORS.calloutUri, scope);
+    const title = findElementBySelectors(SELECTORS.calloutTitle, scope);
+    if (!uri) throw new Error('Champ lien callout introuvable.');
+    if (!title) throw new Error('Champ titre callout introuvable.');
+    setInputValue(uri, data.preinscriptionLink);
+    setInputValue(title, CONFIG.PREINSCRIPTION_BUTTON_TEXT);
+  }
+
+  /***************************************************************************
+   * BILAN EXCEL DES MISES À JOUR
+   ***************************************************************************/
+  function loadPersistedUpdateReport() {
+    state.updateReport = readStoredJson(STORAGE_KEYS.updateReport, []) || [];
+  }
+
+  function recordUpdateReport(item, data, dates) {
+    loadPersistedUpdateReport();
+    const entry = {
+      dateMiseAJour: new Date().toLocaleString('fr-FR'),
+      drupalParcoursId: item?.drupalParcoursId || '',
+      drupalTitle: item?.drupalTitle || '',
+      dispositifCode: item?.dispositifCode || '',
+      moduleCode: item?.moduleCode || '',
+      placesRestantes: calculateRemainingPlaces(data?.preinscritsTotal, data?.preinscritsMax),
+      preinscritsTotal: data?.preinscritsTotal || '',
+      preinscritsMax: data?.preinscritsMax || '',
+      lienPreinscription: data?.preinscriptionLink || '',
+      dateDebutSaisie: dates?.startDate || data?.publicationStartDate || '',
+      dateFinSaisie: dates?.endDate || data?.publicationEndDate || '',
+      dateDepublicationSaisie: dates?.unpublishDate || '',
+      sessionsSaisies: formatReportSessions(data?.sessions?.length ? data.sessions : [data])
+    };
+    const withoutSameItem = state.updateReport.filter((row) => row.drupalParcoursId !== entry.drupalParcoursId);
+    state.updateReport = [...withoutSameItem, entry];
+    writeStoredJson(STORAGE_KEYS.updateReport, state.updateReport);
+    log('success', item, `Bilan Excel mémorisé : ${entry.placesRestantes} place(s) restante(s).`);
+  }
+
+  function formatReportSessions(sessions) {
+    return (sessions || []).map((session, index) => {
+      const start = session.sessionStartDateTime || toDisplayDateTime(session.sessionStartRaw);
+      const end = session.sessionEndDateTime || toDisplayDateTime(session.sessionEndRaw);
+      return `Session ${index + 1} | Modalité : ${session.modalite || ''} | Date et heure : Du ${start || ''} au ${end || ''} | Lieu : ${session.lieu || ''}`;
+    }).join('\n');
+  }
+
+  function exportUpdateReportExcel() {
+    loadPersistedUpdateReport();
+    if (!state.updateReport.length) {
+      setAlert('Aucun bilan à exporter pour le moment. Lancez au moins une mise à jour de parcours.');
+      log('warning', null, 'Export bilan Excel demandé sans donnée disponible.');
+      return;
+    }
+    if (!window.XLSX) throw new Error('SheetJS XLSX non chargé : export Excel impossible.');
+
+    const rows = state.updateReport.map((row) => ({
+      'Date de mise à jour': row.dateMiseAJour,
+      'ID parcours Drupal': row.drupalParcoursId,
+      'Titre Drupal': row.drupalTitle,
+      'Dispositif': row.dispositifCode,
+      'Module': row.moduleCode,
+      'Nombre de places restantes': row.placesRestantes,
+      'Nombre inscrits': row.preinscritsTotal,
+      'Nombre maximal': row.preinscritsMax,
+      'Lien de préinscription': row.lienPreinscription,
+      'Date début saisie': row.dateDebutSaisie,
+      'Date fin saisie': row.dateFinSaisie,
+      'Date dépublication saisie': row.dateDepublicationSaisie,
+      'Sessions saisies': row.sessionsSaisies
+    }));
+
+    const workbook = XLSX.utils.book_new();
+    const sheet = XLSX.utils.json_to_sheet(rows);
+    XLSX.utils.book_append_sheet(workbook, sheet, 'Bilan mises à jour');
+    const content = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    downloadFile(`eafc-bilan-mises-a-jour-${stamp}.xlsx`, content, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  }
+
+  /***************************************************************************
+   * LOGS
+   ***************************************************************************/
+  function log(level, item, message) {
+    const entry = {
+      timestamp: new Date().toISOString(),
+      level,
+      drupalParcoursId: item?.drupalParcoursId || '',
+      drupalTitle: item?.drupalTitle || '',
+      dispositifCode: item?.dispositifCode || '',
+      moduleCode: item?.moduleCode || '',
+      message
+    };
+    state.logs.push(entry);
+    console[level === 'error' ? 'error' : level === 'warning' ? 'warn' : 'log']('[EAFC]', entry);
+    renderLogs();
+  }
+
+  function renderLogs() {
+    const box = qs('#eafc-logbox');
+    if (!box) return;
+    box.innerHTML = state.logs.slice(-250).map((entry) => `<div class="eafc-log-${entry.level}">[${entry.timestamp}] ${entry.level.toUpperCase()} ${entry.drupalParcoursId ? `#${escapeHtml(entry.drupalParcoursId)} ` : ''}${escapeHtml(entry.message)}</div>`).join('');
+    box.scrollTop = box.scrollHeight;
+    state.lastSummary.errors = state.logs.filter((entry) => entry.level === 'error').length + state.validationErrors.length;
+    renderSummary();
+  }
+
+  function exportLogs() {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const json = JSON.stringify(state.logs, null, 2);
+    const csv = toCsv(state.logs);
+    downloadFile(`eafc-drupal-logs-${stamp}.json`, json, 'application/json');
+    downloadFile(`eafc-drupal-logs-${stamp}.csv`, csv, 'text/csv;charset=utf-8');
+  }
+
+  function toCsv(rows) {
+    const headers = ['timestamp', 'level', 'drupalParcoursId', 'drupalTitle', 'dispositifCode', 'moduleCode', 'message'];
+    const escapeCsv = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    return [headers.join(','), ...rows.map((row) => headers.map((h) => escapeCsv(row[h])).join(','))].join('\n');
+  }
+
+  /***************************************************************************
+   * UTILITAIRES DOM / ACTIONS
+   ***************************************************************************/
+  function qs(selector, scope = document) { return scope.querySelector(selector); }
+
+  function findElementBySelectors(selectors, scope = document) {
+    for (const selector of selectors) {
+      if (selector.includes(':contains(')) continue;
+      const found = Array.from(scope.querySelectorAll(selector)).find(isVisible) || scope.querySelector(selector);
+      if (found) return found;
+    }
+    if (selectors.some((s) => s.includes(':contains("Modifier")'))) {
+      return Array.from(scope.querySelectorAll('a,button,input[type="submit"]')).find((el) => /modifier/i.test(el.textContent || el.value || '') && isVisible(el));
+    }
+    return null;
+  }
+
+  async function waitForSelector(selector, timeout = CONFIG.MAX_WAIT_TIME) {
+    return waitForFunction(() => document.querySelector(selector), timeout, `Sélecteur introuvable : ${selector}`);
+  }
+
+  async function waitForAnySelector(selectors, timeout = CONFIG.MAX_WAIT_TIME) {
+    return waitForFunction(() => findElementBySelectors(selectors), timeout, `Aucun sélecteur trouvé : ${selectors.join(' | ')}`);
+  }
+
+  async function waitForFunction(fn, timeout, errorMessage) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      const result = fn();
+      if (result) return result;
+      await sleep(150);
+    }
+    throw new Error(errorMessage || 'Attente expirée.');
+  }
+
+  async function waitForLocation(path, timeout = CONFIG.MAX_WAIT_TIME) {
+    await waitForFunction(() => location.pathname.startsWith(path), timeout, `Navigation vers ${path} non confirmée.`);
+    await sleep(500);
+  }
+
+
+  async function waitForAjax(timeout = CONFIG.MAX_WAIT_TIME) {
+    const start = Date.now();
+    await sleep(300);
+    while (Date.now() - start < timeout) {
+      const ajaxActive = Boolean(document.querySelector('.ajax-progress, .ajax-progress-throbber, .ui-dialog .ajax-progress'));
+      const documentBusy = document.body.getAttribute('aria-busy') === 'true' || document.documentElement.getAttribute('aria-busy') === 'true';
+      if (!ajaxActive && !documentBusy) return;
+      await sleep(150);
+    }
+  }
+
+  async function clickElement(element, label = 'clic') {
+    if (!element) throw new Error(`Élément introuvable pour ${label}.`);
+    element.scrollIntoView({ block: 'center', inline: 'center' });
+    highlightElement(element);
+    if (CONFIG.SAFE_CLICK_MODE) {
+      const descriptor = `${label}\n\nÉlément : ${describeElement(element)}\n\nValider ce clic ?`;
+      if (!window.confirm(descriptor)) throw new Error(`Clic annulé par l’utilisateur : ${label}.`);
+    }
+    element.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+    element.click();
+    await sleep(CONFIG.DELAY_BETWEEN_ACTIONS);
+  }
+
+  function setInputValue(element, value) {
+    if (!element) throw new Error('Champ introuvable.');
+    element.scrollIntoView({ block: 'center', inline: 'center' });
+    element.focus();
+    element.value = value == null ? '' : String(value);
+    dispatchAllEvents(element);
+  }
+
+  function setSelectValue(select, value, fallbackLabel = '') {
+    if (!select) throw new Error('Select introuvable.');
+    const wanted = String(value || '');
+    const option = Array.from(select.options || []).find((opt) => opt.value === wanted)
+      || Array.from(select.options || []).find((opt) => normalizeText(opt.textContent) === normalizeText(fallbackLabel || wanted));
+    if (!option) throw new Error(`Option select introuvable : ${wanted}.`);
+    select.value = option.value;
+    dispatchAllEvents(select);
+  }
+
+  function dispatchAllEvents(element) {
+    ['input', 'change', 'blur'].forEach((type) => element.dispatchEvent(new Event(type, { bubbles: true, cancelable: true })));
+  }
+
+  function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+  function normalizeText(text) {
+    return String(text || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  function normalizeColumnName(text) {
+    return normalizeText(text).replace(/[_\-:]/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  function normalizeRne(value) {
+    const text = String(value ?? '').trim().toUpperCase();
+    const match = text.match(/\b0?[0-9]{2,3}[0-9A-Z]{4,6}[A-Z]\b/);
+    return match ? match[0].padStart(8, '0') : text;
+  }
+
+  function extractRneFromText(text) {
+    const match = String(text || '').toUpperCase().match(/\[?\b(0?[0-9]{2,3}[0-9A-Z]{4,6}[A-Z])\b\]?/);
+    return match ? normalizeRne(match[1]) : '';
+  }
+
+  function departmentFromRne(rne) {
+    const normalized = normalizeRne(rne);
+    return normalized ? normalizeTerritoireCode(normalized.slice(0, 3)) : '';
+  }
+
+  function normalizeTerritoireCode(value) {
+    const text = String(value ?? '').trim().toUpperCase();
+    if (!text) return '';
+    const digits = text.match(/\d{2,3}/)?.[0] || text;
+    return digits.length === 3 && digits.startsWith('0') ? digits.slice(1) : digits;
+  }
+
+  function cleanCode(value) {
+    return String(value ?? '').trim().replace(/\.0$/, '');
+  }
+
+  function stringifyCell(value) {
+    if (value == null) return '';
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    return String(value).trim();
+  }
+
+  function escapeHtml(text) {
+    return String(text ?? '').replace(/[&<>'"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c]));
+  }
+
+  function downloadFile(filename, content, mimeType) {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    if (typeof GM_download === 'function') {
+      GM_download({ url, name: filename, saveAs: true, ontimeout: () => URL.revokeObjectURL(url), onerror: () => fallbackDownload(url, filename), onload: () => setTimeout(() => URL.revokeObjectURL(url), 1000) });
+    } else {
+      fallbackDownload(url, filename);
+    }
+  }
+
+  function fallbackDownload(url, filename) {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function isVisible(element) {
+    if (!element) return false;
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width >= 0 && rect.height >= 0;
+  }
+
+  function isClickableVisible(element) {
+    if (!element) return false;
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== 'none'
+      && style.visibility !== 'hidden'
+      && style.pointerEvents !== 'none'
+      && rect.width > 0
+      && rect.height > 0;
+  }
+
+  function highlightElement(element) {
+    const oldOutline = element.style.outline;
+    element.style.outline = '3px solid #ffb000';
+    setTimeout(() => { element.style.outline = oldOutline; }, 1200);
+  }
+
+  function describeElement(element) {
+    const text = normalizeText(element.textContent || element.value || '').slice(0, 100);
+    return `<${element.tagName.toLowerCase()} id="${element.id || ''}" name="${element.getAttribute('name') || ''}" data-drupal-selector="${element.getAttribute('data-drupal-selector') || ''}"> ${text}`;
+  }
+
+  function captureTextContext() {
+    return normalizeText(document.title + ' ' + location.href + ' ' + document.body.textContent).slice(0, 500);
+  }
+
+  function setStatus(message) {
+    const el = qs('#eafc-status');
+    if (el) el.textContent = message;
+  }
+
+  function setAlert(message) {
+    const el = qs('#eafc-alert');
+    if (el) el.textContent = message;
+  }
+
+  loadPersistedUiConfig();
+  initPanel();
+  loadPersistedImports();
+  log('info', null, 'Script EAFC Drupal chargé. Mode simulation et sécurité clic activés par défaut.');
+})();
