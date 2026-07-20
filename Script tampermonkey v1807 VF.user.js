@@ -39,7 +39,7 @@
     MATCH_EXCEL_BY_DISPOSITIF_ONLY: true,
     THEMATIC_AUTOCOMPLETE_DELAY_MS: 800,
     THEMATIC_AUTOCOMPLETE_SELECTION_DELAY_MS: 600,
-    // Thématiques obligatoires ajoutées à chaque fiche Drupal.
+    // Thématiques obligatoires conservées pour compatibilité, mais non ajoutées automatiquement pendant une mise à jour.
     REQUIRED_THEMATICS: ['EAFC poitiers', '6331'],
     // Mapping conservé du module isolé : alias source -> identifiants Drupal existants.
     THEMATIC_ALIAS_MAP: [
@@ -2353,10 +2353,6 @@
         const value = String(thematicId).trim();
         if (value && !values.includes(value)) values.push(value);
       });
-    });
-    CONFIG.REQUIRED_THEMATICS.forEach((thematic) => {
-      const value = String(thematic).trim();
-      if (value && !values.includes(value)) values.push(value);
     });
     return values;
   }
