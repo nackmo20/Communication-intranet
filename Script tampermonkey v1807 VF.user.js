@@ -1177,9 +1177,18 @@
   }
 
   async function openFirstResult(item) {
-    const link = await waitForFunction(getFirstResultTitleLink, CONFIG.MAX_WAIT_TIME, 'Lien du premier résultat dans la colonne titre introuvable.');
+    const link = await waitForFunction(getFirstResultTitleLink, CONFIG.MAX_WAIT_TIME, 'Lien du premier résultat dans la colonne titre introuvable.').catch(() => null);
+    if (!link && item?.pageUrl) {
+      log('warning', item, `Résultat admin introuvable : navigation de secours vers ${item.pageUrl}.`);
+      location.href = item.pageUrl;
+      await sleep(1000);
+      return;
+    }
+    if (!link) throw new Error('Lien du premier résultat dans la colonne titre introuvable.');
+
     const row = link.closest('tr');
-    if (row && !row.textContent.includes(item.drupalParcoursId)) log('warning', item, 'Le premier résultat ne contient pas clairement l’ID filtré dans la ligne.');
+    const expectedId = item.drupalParcoursId || item.nodeId || '';
+    if (row && expectedId && !row.textContent.includes(expectedId)) log('warning', item, 'Le premier résultat ne contient pas clairement l’ID filtré dans la ligne.');
     log('info', item, `Ouverture du résultat : ${normalizeText(link.textContent).slice(0, 120)}`);
     await clickElement(link, 'Ouvrir le premier résultat Drupal');
     await sleep(1000);
@@ -1664,12 +1673,11 @@
   /***************************************************************************
    * MISES À JOUR INTRANET (CONTENU ET TAXONOMIES)
    ***************************************************************************/
-  const INTRANET_PAYLOAD_TYPES = ['update_drupal_pages', 'bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'];
-  const INTRANET_FIELDS = ['title', 'objectif', 'contenu', 'accessibilite', 'miseEnPlace', 'effectif', 'dureeTotale', 'presentielH', 'distancielH', 'publics', 'prerequis', 'contact', 'theme', 'metiersPublics', 'lieux', 'departements', 'publicationDate', 'preinscriptionStartDate', 'unpublishDate', 'preinscriptionLinks'];
+  const INTRANET_PAYLOAD_TYPES = ['update_drupal_pages', 'bulk_drupal_theme_public_update'];
+  const INTRANET_FIELDS = ['title', 'objectif', 'contenu', 'accessibilite', 'miseEnPlace', 'effectif', 'dureeTotale', 'presentielH', 'distancielH', 'publics', 'prerequis', 'contact', 'theme', 'metiersPublics', 'departements', 'unpublishDate', 'preinscriptionLinks'];
   const EDITORIAL_FIELDS = ['objectif', 'contenu', 'accessibilite', 'miseEnPlace', 'effectif', 'dureeTotale', 'presentielH', 'distancielH', 'publics', 'prerequis', 'contact'];
-  const TAXONOMY_FIELDS = ['theme', 'metiersPublics', 'departements', 'lieux'];
+  const TAXONOMY_FIELDS = ['theme', 'metiersPublics', 'departements'];
   const CONTENT_OPERATIONS = ['add', 'replace', 'delete'];
-  const BULK_OPERATIONS = ['add', 'remove', 'replace_all', 'replace_term', 'clean'];
   const THEME_PUBLIC_OPERATIONS = ['add', 'remove', 'replace', 'clear'];
   const REPORT_STATUSES = ['success', 'partial_success', 'already_up_to_date', 'conflict', 'page_not_found', 'field_not_found', 'save_failed', 'access_denied', 'skipped', 'cancelled'];
 
@@ -1718,27 +1726,41 @@
     if (!payload.type) errors.push('Propriété type absente.');
     else if (!INTRANET_PAYLOAD_TYPES.includes(payload.type)) errors.push(`Type inconnu : ${payload.type}.`);
     if (!String(payload.batchId || '').trim()) errors.push('Batch ID absent.');
-    if (payload.type === 'update_drupal_pages' && !Array.isArray(payload.items)) errors.push('Tableau items absent.');
-    if (['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(payload.type) && !Array.isArray(payload.targets)) errors.push('Tableau targets absent.');
+    if (payload.type === 'update_drupal_pages') {
+      if (payload.version !== '3.0') errors.push('Version update_drupal_pages non prise en charge.');
+      if (!Array.isArray(payload.items)) errors.push('items[] est obligatoire.');
+    }
+    if (payload.type === 'bulk_drupal_theme_public_update') {
+      if (payload.version !== '1.0') errors.push('Version bulk_drupal_theme_public_update non prise en charge.');
+      if (!Array.isArray(payload.targets)) errors.push('targets[] est obligatoire.');
+    }
     const targets = normalizeIntranetTargets(payload);
     if (!targets.length) errors.push('Aucune cible exploitable dans le payload.');
     const seen = new Map();
     targets.forEach((target, index) => {
       if (!String(target.nodeId || '').trim()) errors.push(`Cible ${index + 1} : Node ID absent.`);
-      const requested = payload.type === 'update_drupal_pages' || payload.type === 'bulk_drupal_theme_public_update' ? target.changes : target.expectedAfter;
+      const requested = target.changes;
       if (!requested || typeof requested !== 'object' || Array.isArray(requested) || !Object.keys(requested).length) errors.push(`Cible ${target.nodeId || index + 1} vide : changes/expectedAfter absent.`);
       Object.entries(requested || {}).forEach(([field, request]) => {
         if (!INTRANET_FIELDS.includes(field)) errors.push(`Cible ${target.nodeId}: champ inconnu ${field}.`);
         if (payload.type === 'update_drupal_pages') {
           if (!request || typeof request !== 'object') errors.push(`Cible ${target.nodeId}, ${field}: demande invalide.`);
-          else if (!CONTENT_OPERATIONS.includes(request.operation)) errors.push(`Cible ${target.nodeId}, ${field}: opération inconnue ${request.operation}.`);
+          else {
+            if (!CONTENT_OPERATIONS.includes(request.operation)) errors.push(`Cible ${target.nodeId}, ${field}: opération inconnue ${request.operation}.`);
+            if (!Object.prototype.hasOwnProperty.call(request, 'value')) errors.push(`Cible ${target.nodeId}, ${field}: value est obligatoire pour update_drupal_pages.`);
+            if (Object.prototype.hasOwnProperty.call(request, 'values')) errors.push(`Cible ${target.nodeId}, ${field}: values est interdit pour update_drupal_pages.`);
+          }
           if (field === 'title' && request?.operation === 'delete') errors.push(`Cible ${target.nodeId}, title: invalid_operation (le titre ne peut pas être vidé).`);
         }
         if (payload.type === 'bulk_drupal_theme_public_update') {
           if (!['theme', 'publics'].includes(field)) errors.push(`Cible ${target.nodeId}: le format thématiques/publics ne reconnaît que theme et publics.`);
           if (!request || typeof request !== 'object' || !Array.isArray(request.values)) errors.push(`Cible ${target.nodeId}, ${field}: values doit être un tableau.`);
-          else if (!THEME_PUBLIC_OPERATIONS.includes(request.operation)) errors.push(`Cible ${target.nodeId}, ${field}: opération inconnue ${request.operation}.`);
-          if (!Object.prototype.hasOwnProperty.call(target.expectedAfter || {}, field)) errors.push(`Cible ${target.nodeId}, ${field}: expectedAfter absent.`);
+          else {
+            if (!THEME_PUBLIC_OPERATIONS.includes(request.operation)) errors.push(`Cible ${target.nodeId}, ${field}: opération inconnue ${request.operation}.`);
+            if (Object.prototype.hasOwnProperty.call(request, 'value')) errors.push(`Cible ${target.nodeId}, ${field}: value est interdit pour bulk_drupal_theme_public_update.`);
+          }
+          if (!Array.isArray(target.expectedAfter?.[field])) errors.push(`Cible ${target.nodeId}, ${field}: expectedAfter doit être un tableau.`);
+          else if (request?.values && !compareTaxonomySets(request.values, target.expectedAfter[field])) errors.push(`Cible ${target.nodeId}, ${field}: changes.${field}.values doit correspondre à expectedAfter.${field}.`);
         }
         const key = `${target.nodeId}|${field}`;
         const signature = JSON.stringify(request);
@@ -1746,13 +1768,6 @@
         seen.set(key, signature);
       });
     });
-    if (payload.type === 'bulk_drupal_taxonomy_update') {
-      (payload.operations || []).forEach((operation, index) => {
-        if (!['publics', 'thematiques', 'theme', 'metiersPublics', 'departements', 'lieux'].includes(operation.field)) errors.push(`Opération massive ${index + 1}: champ inconnu ${operation.field}.`);
-        if (!BULK_OPERATIONS.includes(operation.operation)) errors.push(`Opération massive ${index + 1}: opération inconnue ${operation.operation}.`);
-      });
-      if (payload.selection?.selectedCount != null && Number(payload.selection.selectedCount) !== targets.length) warnings.push(`selection.selectedCount (${payload.selection.selectedCount}) diffère du nombre de cibles (${targets.length}).`);
-    }
     if (payload.type === 'bulk_drupal_theme_public_update' && payload.selection?.selectedCount != null && Number(payload.selection.selectedCount) !== targets.length) warnings.push(`selection.selectedCount (${payload.selection.selectedCount}) diffère du nombre de cibles (${targets.length}).`);
     return { errors: [...new Set(errors)], warnings: [...new Set(warnings)], targets };
   }
@@ -1766,10 +1781,10 @@
         departmentCodes: Array.isArray(target.departmentCodes) ? target.departmentCodes : [], expectedBefore: target.expectedBefore || {}, changes: target.changes || {}
       })));
     }
-    if (['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(payload?.type)) return (payload.targets || []).map((target) => ({
+    if (payload?.type === 'bulk_drupal_theme_public_update') return (payload.targets || []).map((target) => ({
       batchId: payload.batchId, payloadType: payload.type, nodeId: String(target.nodeId || '').trim(), pageUrl: target.pageUrl || '',
       title: target.title || '', requestedTitle: target.title || '', inventorySheet: target.inventorySheet || '', sourceOvp: target.sourceOvp || '',
-      expectedBefore: target.expectedBefore || {}, changes: target.changes || {}, expectedAfter: target.expectedAfter || {}, operations: payload.operations || []
+      expectedBefore: target.expectedBefore || {}, changes: target.changes || {}, expectedAfter: target.expectedAfter || {}
     }));
     return [];
   }
@@ -1778,14 +1793,10 @@
     return targets.map((target) => {
       const desired = payload.type === 'update_drupal_pages'
         ? Object.fromEntries(Object.entries(target.changes).map(([field, change]) => [field, change.value]))
-        : payload.type === 'bulk_drupal_theme_public_update'
-          ? Object.fromEntries(Object.keys(target.changes).map((field) => [field, target.expectedAfter[field]]))
-          : target.expectedAfter;
+        : Object.fromEntries(Object.entries(target.changes).map(([field, change]) => [field, change.values]));
       const destructive = payload.type === 'update_drupal_pages'
         ? Object.values(target.changes).filter((change) => change.operation === 'delete').length
-        : payload.type === 'bulk_drupal_theme_public_update'
-          ? Object.values(target.changes).filter((change) => ['remove', 'replace', 'clear'].includes(change.operation)).length
-          : (payload.operations || []).filter((operation) => ['remove', 'replace_all', 'replace_term'].includes(operation.operation)).length;
+        : Object.values(target.changes).filter((change) => ['remove', 'replace', 'clear'].includes(change.operation)).length;
       return { nodeId: target.nodeId, title: target.requestedTitle || target.title || '', fields: Object.keys(desired), before: target.expectedBefore || {}, after: desired, destructive };
     });
   }
@@ -1838,8 +1849,6 @@
     }
     const existing = readBatchState();
     if (existing.active) return runPersistedBatchStep();
-    const replaceAll = intranet.payload.type === 'bulk_drupal_taxonomy_update' && (intranet.payload.operations || []).some((operation) => operation.operation === 'replace_all');
-    if (replaceAll && !CONFIG.DRY_RUN && !window.confirm('Confirmation supplémentaire : replace_all remplacera réellement tous les termes ciblés. Continuer ?')) return;
     const safe = intranet.payload.settings?.safeMode === true;
     const summary = `${intranet.normalizedTargets.length} cible(s), workflow ${state.activeWorkflow}, simulation=${CONFIG.DRY_RUN ? 'oui' : 'non'}, auto-save=${CONFIG.AUTO_SAVE ? 'oui' : 'non'}${safe ? ', safeMode=oui (aucun enregistrement automatique)' : ''}. Continuer ?`;
     if (!window.confirm(summary)) return;
@@ -1851,7 +1860,7 @@
   }
 
   function resolveDrupalTargetField(payloadType, fieldName) {
-    if (fieldName === 'publics') return ['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(payloadType) ? 'metiersPublics' : 'editorialPublics';
+    if (fieldName === 'publics') return payloadType === 'bulk_drupal_theme_public_update' ? 'metiersPublics' : 'editorialPublics';
     if (fieldName === 'thematiques') return 'theme';
     return fieldName;
   }
@@ -1906,7 +1915,11 @@
       result.fullHtml = await getCurrentHtmlFromEditor();
       Object.assign(values, extractRequestedFormationHtmlValues(result.fullHtml, [...new Set([...htmlFields, ...Object.keys(target.expectedBefore || {}).filter((field) => EDITORIAL_FIELDS.includes(field))])]));
     }
-    for (const originalField of requestedFields.filter((field) => ['theme', 'thematiques', 'metiersPublics', 'departements', 'lieux'].includes(field) || (['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(target.payloadType) && field === 'publics'))) {
+    const taxonomyFieldsToRead = [...new Set([
+      ...requestedFields,
+      ...Object.keys(target.expectedBefore || {})
+    ])].filter((field) => ['theme', 'thematiques', 'metiersPublics', 'departements'].includes(field) || (target.payloadType === 'bulk_drupal_theme_public_update' && field === 'publics'));
+    for (const originalField of taxonomyFieldsToRead) {
       const field = resolveDrupalTargetField(target.payloadType, originalField);
       const current = readTaxonomyField(field);
       values[originalField] = current;
@@ -1918,7 +1931,7 @@
     return result;
   }
 
-  function getRequestedFields(target) { return Object.keys(['update_drupal_pages', 'bulk_drupal_theme_public_update'].includes(target.payloadType) ? target.changes || {} : target.expectedAfter || {}); }
+  function getRequestedFields(target) { return Object.keys(target.changes || {}); }
 
   async function prepareFormationEditor(target) {
     await clickFormationBodyEditBeforeRichText(target);
@@ -2049,13 +2062,11 @@
 
   async function applyTaxonomyChanges(target) {
     const result = emptyApplyResult();
-    const desiredEntries = target.payloadType === 'bulk_drupal_taxonomy_update'
-      ? Object.entries(target.expectedAfter || {})
-      : Object.entries(target.changes || {}).filter(([field]) => TAXONOMY_FIELDS.includes(field) || (target.payloadType === 'bulk_drupal_theme_public_update' && field === 'publics'));
+    const desiredEntries = Object.entries(target.changes || {}).filter(([field]) => TAXONOMY_FIELDS.includes(field) || (target.payloadType === 'bulk_drupal_theme_public_update' && field === 'publics'));
     for (const [originalField, request] of desiredEntries) {
       const field = resolveDrupalTargetField(target.payloadType, originalField);
-      if (!['theme', 'metiersPublics', 'departements', 'lieux'].includes(field)) continue;
-      const desired = ['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(target.payloadType) ? normalizeTerms(target.expectedAfter?.[originalField]) : normalizeTerms(request.value);
+      if (!['theme', 'metiersPublics', 'departements'].includes(field)) continue;
+      const desired = target.payloadType === 'bulk_drupal_theme_public_update' ? normalizeTerms(request.values) : normalizeTerms(request.value);
       const current = readTaxonomyField(field);
       if (compareTaxonomySets(current, desired)) { unchangedField(result, originalField, current); continue; }
       try {
@@ -2309,7 +2320,7 @@
     const differences = [];
     Object.entries(target.expectedBefore || {}).forEach(([field, expected]) => {
       const actual = current[field];
-      const taxonomy = Array.isArray(expected) || ['theme', 'thematiques', 'metiersPublics', 'departements', 'lieux'].includes(resolveDrupalTargetField(target.payloadType, field)) || (['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(target.payloadType) && field === 'publics');
+      const taxonomy = Array.isArray(expected) || ['theme', 'thematiques', 'metiersPublics', 'departements'].includes(resolveDrupalTargetField(target.payloadType, field)) || (target.payloadType === 'bulk_drupal_theme_public_update' && field === 'publics');
       const same = taxonomy ? compareTaxonomySets(actual, expected) : compareTextValues(actual, expected);
       if (!same) differences.push({ field, expected, actual, code: 'conflict', message: `expectedBefore différent pour ${field}.` });
     });
