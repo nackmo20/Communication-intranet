@@ -36,7 +36,26 @@
     // Correspondance demandée : le mapping JSON donne l'identifiant dispositif,
     // l'Excel est retrouvé via la colonne exacte/souple "Dispositif : code".
     // Le module reste conservé pour les logs et diagnostics, mais n'est plus bloquant.
-    MATCH_EXCEL_BY_DISPOSITIF_ONLY: true
+    MATCH_EXCEL_BY_DISPOSITIF_ONLY: true,
+    THEMATIC_AUTOCOMPLETE_DELAY_MS: 800,
+    THEMATIC_AUTOCOMPLETE_SELECTION_DELAY_MS: 600,
+    // Thématiques obligatoires ajoutées à chaque fiche Drupal.
+    REQUIRED_THEMATICS: ['EAFC poitiers', '6331'],
+    // Mapping conservé du module isolé : alias source -> identifiants Drupal existants.
+    THEMATIC_ALIAS_MAP: [
+      [['Pédagogique', 'Pratique pédagogique transversales', 'Pratiques pédagogiques transversales'], ['6624']],
+      [['Numérique', 'Compétences, culture et usages du numérique'], ['6362']],
+      [['QVCT, SST', 'QVCT', 'SST', 'Qualité de vie au travail – Santé et sécurité au travail'], ['6385', '6404']],
+      [['Valeurs de la république, citoyenneté', 'Valeurs de la République et citoyenneté', 'Valeurs de la république', 'citoyenneté'], ['6627', '6236']],
+      [['Orientation', 'Orientation et parcours scolaire'], ['6364']],
+      [['Ecole inclusive', 'École inclusive', 'Ecole inclusive, accessible et ouverte à tous'], ['6314']],
+      [['Europe et international', 'Ouverture européenne et internationale'], ['6328']],
+      [['Formateurs', 'Formation de formateurs et tuteurs'], ['6625']],
+      [['Santé des élèves', 'Santé mentale et bien-être des élèves'], ['6403']],
+      [['Encadrement'], ['6455']],
+      [['Carrière', 'Carrière et évolution professionnelle'], ['6227']],
+      [['2nd degré', 'Second degré'], ['6202']]
+    ]
   };
 
   const SELECTORS = {
@@ -173,10 +192,16 @@
     ],
     thematics: [
       'input[name^="field_formation_thematic["][name$="[target_id]"]',
+      'input[data-drupal-selector^="edit-field-formation-thematic-"][data-autocomplete-path]',
       'input[data-drupal-selector^="edit-field-formation-thematic-"][data-drupal-selector$="-target-id"]',
       'input[name*="field_thematique"]',
       'input[name*="field_theme"]'
     ],
+    thematicAddMore: [
+      '[data-drupal-selector="edit-field-formation-thematic-add-more"]',
+      'input[name="field_formation_thematic_add_more"]'
+    ],
+    publicTreeWrapper: ['#edit-field-metier-tags-wrapper'],
     save: [
       'input[data-drupal-selector="edit-submit"]',
       'input#edit-submit',
@@ -275,6 +300,8 @@
           <button id="eafc-export" class="eafc-btn secondary" type="button">Exporter les logs</button>
           <button id="eafc-export-report" class="eafc-btn secondary" type="button">Exporter bilan Excel</button>
           <button id="eafc-export-intranet-report" class="eafc-btn secondary" type="button">Exporter rapport JSON</button>
+          <button id="eafc-reset-intranet" class="eafc-btn secondary" type="button">Reset JSON maj public/contenu</button>
+          <button id="eafc-reset-excel" class="eafc-btn secondary" type="button">Retirer Excel</button>
           <button id="eafc-reset-imports" class="eafc-btn danger" type="button">Reset JSON/Excel</button>
         </div>
         <div id="eafc-errors" class="eafc-errors" hidden></div>
@@ -302,6 +329,8 @@
     qs('#eafc-export').addEventListener('click', exportLogs);
     qs('#eafc-export-report').addEventListener('click', exportUpdateReportExcel);
     qs('#eafc-export-intranet-report').addEventListener('click', exportIntranetReportJson);
+    qs('#eafc-reset-intranet').addEventListener('click', resetIntranetUpdateData);
+    qs('#eafc-reset-excel').addEventListener('click', resetExcelData);
     qs('#eafc-reset-imports').addEventListener('click', resetImportedData);
     qs('.eafc-toggle').addEventListener('click', () => {
       state.panelCollapsed = !state.panelCollapsed;
@@ -409,6 +438,84 @@
   }
 
 
+  function resetIntranetUpdateData() {
+    if (!state.intranetUpdate.payload && !readStoredJson(STORAGE_KEYS.intranetPayload, null)) {
+      setAlert('Aucun JSON de mise à jour public/contenu n’est actuellement chargé.');
+      setStatus('Aucun JSON de mise à jour à réinitialiser.');
+      return;
+    }
+    if (!window.confirm('Réinitialiser uniquement le JSON de mise à jour public/contenu ? Le mapping JSON Sofia et l’Excel seront conservés.')) return;
+
+    state.intranetUpdate = {
+      payload: null,
+      payloadType: '',
+      payloadFileName: '',
+      normalizedTargets: [],
+      validationErrors: [],
+      validationWarnings: [],
+      preview: [],
+      reportItems: [],
+      startedAt: '',
+      finishedAt: '',
+      backupItems: [],
+      backupGenerated: false
+    };
+    state.activeWorkflow = 'sofia';
+    state.stopRequested = true;
+
+    const intranetInput = qs('#eafc-intranet-file');
+    if (intranetInput) intranetInput.value = '';
+
+    deleteStoredValue(STORAGE_KEYS.intranetPayload);
+    deleteStoredValue(STORAGE_KEYS.intranetPayloadFileName);
+    deleteStoredValue(STORAGE_KEYS.intranetBatchState);
+    deleteStoredValue(STORAGE_KEYS.intranetReport);
+    clearBatchState();
+    renderWorkflowMode();
+    renderIntranetPreview();
+    renderSummary();
+    renderErrors();
+    setAlert('JSON de mise à jour public/contenu réinitialisé. Le mapping JSON Sofia et l’Excel sont conservés.');
+    setStatus('JSON de mise à jour réinitialisé.');
+    log('warning', null, 'JSON de mise à jour public/contenu réinitialisé ; mapping JSON Sofia et Excel conservés.');
+  }
+
+
+  function resetExcelData() {
+    if (!state.excelRows.length && !readStoredJson(STORAGE_KEYS.excelRows, []).length) {
+      setAlert('Aucun fichier Excel de mise à jour n’est actuellement chargé.');
+      setStatus('Aucun Excel à retirer.');
+      return;
+    }
+    if (!window.confirm('Retirer uniquement le fichier Excel de mise à jour ? Le mapping JSON et les imports intranet seront conservés.')) return;
+
+    state.excelRows = [];
+    state.excelIndex = new Map();
+    state.enrichedItems = [];
+    state.validationErrors = [];
+    state.lastSummary = {
+      ...state.lastSummary,
+      excel: 0,
+      matches: 0,
+      errors: 0
+    };
+    state.stopRequested = true;
+
+    const excelInput = qs('#eafc-excel-file');
+    if (excelInput) excelInput.value = '';
+
+    writeStoredJson(STORAGE_KEYS.mappingItems, state.mappingItems);
+    deleteStoredValue(STORAGE_KEYS.excelRows);
+    writeStoredValue(STORAGE_KEYS.savedAt, new Date().toLocaleString('fr-FR'));
+    clearBatchState();
+    renderSummary();
+    renderErrors();
+    setAlert('Fichier Excel retiré. Le mapping JSON est conservé ; importez un nouvel Excel pour relancer l’analyse Sofia.');
+    setStatus('Excel retiré.');
+    log('warning', null, 'Fichier Excel de mise à jour retiré ; mapping JSON conservé.');
+  }
+
+
   function resetImportedData() {
     if (!window.confirm('Réinitialiser le mapping JSON, l’Excel et le batch en cours ?')) return;
     state.mappingItems = [];
@@ -484,7 +591,7 @@
       state.activeWorkflow = 'sofia';
       const text = await file.text();
       const parsed = parseMappingJson(text);
-      state.mappingItems = normalizeMappingItems(parsed.items || parsed);
+      state.mappingItems = normalizeMappingItems(parsed.items || parsed, parsed);
       log('success', null, `${state.mappingItems.length} ligne(s) de mapping importée(s).`);
       state.lastSummary.mapping = state.mappingItems.length;
       persistImportedData('mapping');
@@ -501,7 +608,7 @@
     return data;
   }
 
-  function normalizeMappingItems(items) {
+  function normalizeMappingItems(items, globalData = {}) {
     return (items || []).map((item) => {
       const planSession = item.planSession || item.planSessions?.[0] || {};
       const updateKey = item.tampermonkeyUpdateKeys?.[0] || planSession.tampermonkeyUpdateKey || {};
@@ -518,9 +625,59 @@
         rne: normalizeRne(item.rne || item.uai || planSession.rne || updateKey.rne || extractRneFromText(planSession.lieu || '')),
         planSessionGroupId: cleanCode(planSession.groupId || item.groupId || ''),
         planSessionLabel: cleanCode(planSession.sessionLabel || item.sessionLabel || ''),
+        theme: extractThematicSourceValue(item, globalData),
+        publics: extractPublicSourceValue(item, globalData),
         mappingMode: String(item.mappingMode || 'single')
       };
     });
+  }
+
+  function extractThematicSourceValue(item = {}, globalData = {}) {
+    return firstDefinedValue(
+      item.theme,
+      item.thematiques,
+      item.thematic,
+      item.themes,
+      item.taxonomy?.theme,
+      item.taxonomy?.thematiques,
+      item.changes?.theme?.value,
+      item.expectedAfter?.theme,
+      globalData.theme,
+      globalData.thematiques,
+      globalData.thematic,
+      globalData.themes,
+      globalData.taxonomy?.theme,
+      globalData.taxonomy?.thematiques,
+      globalData.changes?.theme?.value,
+      globalData.expectedAfter?.theme
+    );
+  }
+
+  function extractPublicSourceValue(item = {}, globalData = {}) {
+    return firstDefinedValue(
+      item.publics,
+      item.metiersPublics,
+      item.publicsMetiers,
+      item.taxonomy?.publics,
+      item.taxonomy?.metiersPublics,
+      item.changes?.publics?.value,
+      item.changes?.metiersPublics?.value,
+      item.expectedAfter?.publics,
+      item.expectedAfter?.metiersPublics,
+      globalData.publics,
+      globalData.metiersPublics,
+      globalData.publicsMetiers,
+      globalData.taxonomy?.publics,
+      globalData.taxonomy?.metiersPublics,
+      globalData.changes?.publics?.value,
+      globalData.changes?.metiersPublics?.value,
+      globalData.expectedAfter?.publics,
+      globalData.expectedAfter?.metiersPublics
+    );
+  }
+
+  function firstDefinedValue(...values) {
+    return values.find((value) => value !== undefined && value !== null && !(Array.isArray(value) && !value.length) && String(value).trim() !== '');
   }
 
   /***************************************************************************
@@ -1067,6 +1224,8 @@
     setInputValue(await waitForAnySelector(SELECTORS.endDate, CONFIG.MAX_WAIT_TIME), endDate);
     setInputValue(await waitForAnySelector(SELECTORS.unpublishDate, CONFIG.MAX_WAIT_TIME), unpublishDate);
     log('success', item, `Dates mises à jour : début=${startDate}, fin=${endDate}, dépublication=${unpublishDate}.`);
+
+    await applyPublicsAndThematicsFromSource(item, data);
 
     await clickFormationBodyEditBeforeRichText(item);
 
@@ -1918,6 +2077,171 @@
   function normalizeTerms(value) { return (Array.isArray(value) ? value : String(value ?? '').split(/[;,|\n]/)).map((term) => typeof term === 'object' ? String(term.label || term.name || '') : String(term)).map((term) => term.trim()).filter(Boolean); }
   function normalizedTaxonomySet(terms) { return [...new Set(normalizeTerms(terms).map(normalizeText))].sort(); }
   function compareTaxonomySets(a, b) { return JSON.stringify(normalizedTaxonomySet(a)) === JSON.stringify(normalizedTaxonomySet(b)); }
+
+
+  /***************************************************************************
+   * THÉMATIQUES / PUBLICS — import du module isolé
+   *
+   * Sélectionne uniquement des termes déjà existants dans Drupal : aucune
+   * création de termes de taxonomie n'est effectuée ici.
+   ***************************************************************************/
+  async function applyPublicsAndThematicsFromSource(item = {}, exportData = {}) {
+    await applyMappedThematics({ item, exportData });
+    await applyMappedPublics({ item, exportData });
+  }
+
+  /***************************************************************************
+   * THÉMATIQUES
+   ***************************************************************************/
+  async function applyMappedThematics({ item = {}, exportData = {} } = {}) {
+    const thematics = resolveMappedThematics({ item, exportData });
+    if (!thematics.length) { log('info', item, 'Aucune thématique à ajouter.'); return []; }
+    log('info', item, `Thématiques à ajouter : ${thematics.join(', ')}.`);
+    for (let index = 0; index < thematics.length; index += 1) {
+      const input = await getThematicInputByIndex(index);
+      await fillThematicAutocomplete(input, thematics[index]);
+      if (index < thematics.length - 1) {
+        const addButton = await waitForAnySelector(SELECTORS.thematicAddMore, CONFIG.MAX_WAIT_TIME);
+        await safeClick(addButton, 'Ajouter un autre élément thématique');
+        await waitForAjax();
+      }
+    }
+    return thematics;
+  }
+
+  function resolveMappedThematics({ item = {}, exportData = {} } = {}) {
+    const rawTheme = [exportData.theme, item.theme].filter(Boolean).join(', ');
+    const normalizedTheme = normalize(rawTheme);
+    const values = [];
+    CONFIG.THEMATIC_ALIAS_MAP.forEach(([aliases, thematicIds]) => {
+      if (!aliases.some((alias) => normalizedTheme.includes(normalize(alias)))) return;
+      thematicIds.forEach((thematicId) => {
+        const value = String(thematicId).trim();
+        if (value && !values.includes(value)) values.push(value);
+      });
+    });
+    CONFIG.REQUIRED_THEMATICS.forEach((thematic) => {
+      const value = String(thematic).trim();
+      if (value && !values.includes(value)) values.push(value);
+    });
+    return values;
+  }
+
+  async function getThematicInputByIndex(index) {
+    await waitForAnySelector(SELECTORS.thematics, CONFIG.MAX_WAIT_TIME);
+    const inputs = Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible);
+    const input = inputs[index] || inputs.find((candidate) => !candidate.value) || inputs.at(-1);
+    if (!input) throw new Error(`Champ thématique introuvable pour l'index ${index}.`);
+    return input;
+  }
+
+  async function fillThematicAutocomplete(input, value) {
+    if (!input) throw new Error(`Champ d'autocomplétion introuvable pour : ${value}.`);
+    setValue(input, value);
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    await sleep(Math.max(CONFIG.DELAY_BETWEEN_ACTIONS, CONFIG.THEMATIC_AUTOCOMPLETE_DELAY_MS));
+    await waitForFunction(() => visibleAutocompleteSuggestions().length > 0, 5000, `Suggestion thématique introuvable : ${value}.`);
+    const normalizedValue = normalize(value);
+    const suggestions = visibleAutocompleteSuggestions();
+    const matches = suggestions.filter((element) => {
+      const text = normalize(element.textContent);
+      return text.includes(normalizedValue) || text.includes(`(${normalizedValue})`);
+    });
+    if (!matches.length) throw new Error(`Suggestion thématique introuvable pour la valeur recherchée : ${value}.`);
+    await safeClick(matches[0], `Valider l'autocomplétion : ${value}`);
+    await waitForFunction(() => normalize(input.value) !== normalizedValue || !isVisible(input), 3000, `Thématique non validée par Drupal : ${value}.`);
+    await sleep(Math.max(CONFIG.DELAY_BETWEEN_ACTIONS, CONFIG.THEMATIC_AUTOCOMPLETE_SELECTION_DELAY_MS));
+    await waitForAjax();
+  }
+
+  function visibleAutocompleteSuggestions() {
+    return Array.from(document.querySelectorAll('.ui-autocomplete li, .ui-menu-item, [role="option"]')).filter(isVisible);
+  }
+
+  /***************************************************************************
+   * PUBLICS
+   ***************************************************************************/
+  async function applyMappedPublics({ item = {}, exportData = {} } = {}) {
+    const publics = uniquePublicEntries([...(Array.isArray(exportData.publics) ? exportData.publics : exportData.publics ? [exportData.publics] : []), ...(Array.isArray(item.publics) ? item.publics : item.publics ? [item.publics] : [])]);
+    if (!publics.length) {
+      await clickFancytreeTitle('Tous les personnels', 'Sélectionner le métier par défaut : Tous les personnels', { optional: true, scopeSelector: SELECTORS.publicTreeWrapper[0] });
+      return ['Tous les personnels'];
+    }
+    const selectedPaths = [];
+    for (const entry of publics) {
+      const path = publicPath(entry);
+      if (!path.length) continue;
+      const selected = await clickFancytreePath(SELECTORS.publicTreeWrapper[0], path, `Sélectionner le métier : ${path.join(' > ')}`, { optional: true });
+      if (selected) selectedPaths.push(path.join(' > '));
+    }
+    return selectedPaths;
+  }
+
+  async function clickFancytreePath(scopeSelector, path, message, options = {}) {
+    const cleanPath = path.map(String).map((value) => value.trim()).filter(Boolean);
+    for (const title of cleanPath.slice(0, -1)) await ensureFancytreeExpanded(title, { ...options, scopeSelector });
+    return clickFancytreeTitle(cleanPath.at(-1), message, { ...options, scopeSelector });
+  }
+
+  async function ensureFancytreeExpanded(title, options = {}) {
+    const node = findFancytreeNode(title, options);
+    if (!node) { if (options.optional) { log('warning', null, `Nœud public optionnel introuvable : ${title}.`); return false; } throw new Error(`Nœud Fancytree introuvable : ${title}.`); }
+    const treeItem = node.closest('[role="treeitem"],li');
+    const isExpanded = treeItem?.getAttribute('aria-expanded') === 'true' || node.classList.contains('fancytree-expanded') || treeItem?.classList.contains('fancytree-expanded');
+    if (!isExpanded) {
+      const expander = node.querySelector('.fancytree-expander') || node.closest('.fancytree-node,li')?.querySelector('.fancytree-expander');
+      if (expander) { await safeClick(expander, `Dérouler ${title}`); await waitForAjax(); }
+    }
+    return true;
+  }
+
+  async function clickFancytreeTitle(title, message, options = {}) {
+    await waitForFunction(() => findFancytreeNode(title, options) || options.optional, 8000, `Public introuvable : ${title}.`);
+    const node = findFancytreeNode(title, options);
+    if (!node) { log('warning', null, `Champ public optionnel non trouvé : ${title}.`); return false; }
+    const checkbox = node.querySelector('.fancytree-checkbox,input[type="checkbox"]') || node.closest('.fancytree-node,li')?.querySelector('.fancytree-checkbox,input[type="checkbox"]');
+    if (!checkbox) { if (options.optional) { log('warning', null, `Checkbox publique optionnelle introuvable : ${title}.`); return false; } throw new Error(`Checkbox Fancytree introuvable : ${title}.`); }
+    const treeItem = node.closest('[role="treeitem"],li');
+    const isSelected = treeItem?.getAttribute('aria-selected') === 'true' || node.classList.contains('fancytree-selected') || node.classList.contains('fancytree-partsel') || checkbox.checked || checkbox.getAttribute('aria-checked') === 'true';
+    if (!isSelected) { await safeClick(checkbox, message); await waitForAjax(); }
+    else log('info', null, `Public déjà sélectionné : ${title}.`);
+    return true;
+  }
+
+  function findFancytreeNode(title, options = {}) {
+    const wanted = normalize(title), scope = options.scopeSelector ? document.querySelector(options.scopeSelector) : document;
+    if (!scope) return null;
+    return Array.from(scope.querySelectorAll('.fancytree-node,li')).find((node) => {
+      const text = normalize(node.querySelector('.fancytree-title,label')?.textContent || '');
+      return options.contains ? text.includes(wanted) : text === wanted;
+    }) || null;
+  }
+
+  function uniquePublicEntries(values) {
+    const seen = new Set();
+    return values.filter((value) => {
+      if (!value) return false;
+      const key = typeof value === 'string' ? normalize(value) : normalize(value.id || value.path || value.label);
+      if (!key || seen.has(key)) return false;
+      seen.add(key); return true;
+    });
+  }
+
+  function publicPath(value) {
+    if (typeof value === 'string') return [value.trim()].filter(Boolean);
+    if (value?.path) return String(value.path).split('>').map((part) => part.trim()).filter(Boolean);
+    return [value?.label || value?.id].map((entry) => String(entry || '').trim()).filter(Boolean);
+  }
+
+  /***************************************************************************
+   * DÉPENDANCES PARTAGÉES
+   *
+   * Ces alias réutilisent les utilitaires historiques du script cible pour
+   * éviter toute deuxième implémentation conflictuelle.
+   ***************************************************************************/
+  const safeClick = clickElement;
+  const setValue = setInputValue;
+  const normalize = normalizeText;
   function findTaxonomyContainerByLabel(labels) {
     const wanted = labels.map(normalizeText), candidates = Array.from(document.querySelectorAll('fieldset,.form-item,.field--widget-fancytree,.js-form-wrapper'));
     return candidates.filter((container) => { const label = container.querySelector(':scope > legend, :scope > label, :scope > .fieldset-legend, :scope > .form-item__label'); return label && wanted.includes(normalizeText(label.textContent)); }).sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length)[0] || null;
