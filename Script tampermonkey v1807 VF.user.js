@@ -300,6 +300,7 @@
           <button id="eafc-export" class="eafc-btn secondary" type="button">Exporter les logs</button>
           <button id="eafc-export-report" class="eafc-btn secondary" type="button">Exporter bilan Excel</button>
           <button id="eafc-export-intranet-report" class="eafc-btn secondary" type="button">Exporter rapport JSON</button>
+          <button id="eafc-reset-excel" class="eafc-btn secondary" type="button">Retirer Excel</button>
           <button id="eafc-reset-imports" class="eafc-btn danger" type="button">Reset JSON/Excel</button>
         </div>
         <div id="eafc-errors" class="eafc-errors" hidden></div>
@@ -327,6 +328,7 @@
     qs('#eafc-export').addEventListener('click', exportLogs);
     qs('#eafc-export-report').addEventListener('click', exportUpdateReportExcel);
     qs('#eafc-export-intranet-report').addEventListener('click', exportIntranetReportJson);
+    qs('#eafc-reset-excel').addEventListener('click', resetExcelData);
     qs('#eafc-reset-imports').addEventListener('click', resetImportedData);
     qs('.eafc-toggle').addEventListener('click', () => {
       state.panelCollapsed = !state.panelCollapsed;
@@ -431,6 +433,41 @@
     writeStoredJson(STORAGE_KEYS.excelRows, state.excelRows);
     writeStoredValue(STORAGE_KEYS.savedAt, new Date().toLocaleString('fr-FR'));
     log('info', null, `Import ${source} mémorisé : il sera restauré automatiquement après changement de page Drupal.`);
+  }
+
+
+  function resetExcelData() {
+    if (!state.excelRows.length && !readStoredJson(STORAGE_KEYS.excelRows, []).length) {
+      setAlert('Aucun fichier Excel de mise à jour n’est actuellement chargé.');
+      setStatus('Aucun Excel à retirer.');
+      return;
+    }
+    if (!window.confirm('Retirer uniquement le fichier Excel de mise à jour ? Le mapping JSON et les imports intranet seront conservés.')) return;
+
+    state.excelRows = [];
+    state.excelIndex = new Map();
+    state.enrichedItems = [];
+    state.validationErrors = [];
+    state.lastSummary = {
+      ...state.lastSummary,
+      excel: 0,
+      matches: 0,
+      errors: 0
+    };
+    state.stopRequested = true;
+
+    const excelInput = qs('#eafc-excel-file');
+    if (excelInput) excelInput.value = '';
+
+    writeStoredJson(STORAGE_KEYS.mappingItems, state.mappingItems);
+    deleteStoredValue(STORAGE_KEYS.excelRows);
+    writeStoredValue(STORAGE_KEYS.savedAt, new Date().toLocaleString('fr-FR'));
+    clearBatchState();
+    renderSummary();
+    renderErrors();
+    setAlert('Fichier Excel retiré. Le mapping JSON est conservé ; importez un nouvel Excel pour relancer l’analyse Sofia.');
+    setStatus('Excel retiré.');
+    log('warning', null, 'Fichier Excel de mise à jour retiré ; mapping JSON conservé.');
   }
 
 
