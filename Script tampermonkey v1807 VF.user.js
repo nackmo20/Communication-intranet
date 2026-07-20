@@ -509,7 +509,7 @@
       state.activeWorkflow = 'sofia';
       const text = await file.text();
       const parsed = parseMappingJson(text);
-      state.mappingItems = normalizeMappingItems(parsed.items || parsed);
+      state.mappingItems = normalizeMappingItems(parsed.items || parsed, parsed);
       log('success', null, `${state.mappingItems.length} ligne(s) de mapping importée(s).`);
       state.lastSummary.mapping = state.mappingItems.length;
       persistImportedData('mapping');
@@ -526,7 +526,7 @@
     return data;
   }
 
-  function normalizeMappingItems(items) {
+  function normalizeMappingItems(items, globalData = {}) {
     return (items || []).map((item) => {
       const planSession = item.planSession || item.planSessions?.[0] || {};
       const updateKey = item.tampermonkeyUpdateKeys?.[0] || planSession.tampermonkeyUpdateKey || {};
@@ -543,9 +543,59 @@
         rne: normalizeRne(item.rne || item.uai || planSession.rne || updateKey.rne || extractRneFromText(planSession.lieu || '')),
         planSessionGroupId: cleanCode(planSession.groupId || item.groupId || ''),
         planSessionLabel: cleanCode(planSession.sessionLabel || item.sessionLabel || ''),
+        theme: extractThematicSourceValue(item, globalData),
+        publics: extractPublicSourceValue(item, globalData),
         mappingMode: String(item.mappingMode || 'single')
       };
     });
+  }
+
+  function extractThematicSourceValue(item = {}, globalData = {}) {
+    return firstDefinedValue(
+      item.theme,
+      item.thematiques,
+      item.thematic,
+      item.themes,
+      item.taxonomy?.theme,
+      item.taxonomy?.thematiques,
+      item.changes?.theme?.value,
+      item.expectedAfter?.theme,
+      globalData.theme,
+      globalData.thematiques,
+      globalData.thematic,
+      globalData.themes,
+      globalData.taxonomy?.theme,
+      globalData.taxonomy?.thematiques,
+      globalData.changes?.theme?.value,
+      globalData.expectedAfter?.theme
+    );
+  }
+
+  function extractPublicSourceValue(item = {}, globalData = {}) {
+    return firstDefinedValue(
+      item.publics,
+      item.metiersPublics,
+      item.publicsMetiers,
+      item.taxonomy?.publics,
+      item.taxonomy?.metiersPublics,
+      item.changes?.publics?.value,
+      item.changes?.metiersPublics?.value,
+      item.expectedAfter?.publics,
+      item.expectedAfter?.metiersPublics,
+      globalData.publics,
+      globalData.metiersPublics,
+      globalData.publicsMetiers,
+      globalData.taxonomy?.publics,
+      globalData.taxonomy?.metiersPublics,
+      globalData.changes?.publics?.value,
+      globalData.changes?.metiersPublics?.value,
+      globalData.expectedAfter?.publics,
+      globalData.expectedAfter?.metiersPublics
+    );
+  }
+
+  function firstDefinedValue(...values) {
+    return values.find((value) => value !== undefined && value !== null && !(Array.isArray(value) && !value.length) && String(value).trim() !== '');
   }
 
   /***************************************************************************
