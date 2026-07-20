@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EAFC Drupal - Mise à jour parcours depuis Mapping JSON + Excel
 // @namespace    https://eafc.local/tampermonkey
-// @version      1.8.10
+// @version      1.8.11
 // @description  Met à jour des pages de parcours Drupal depuis un mapping JSON externe et un export Excel EAFC Formation Export plan et sessions.
 // @author       EAFC
 // @match        *://*/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '1.8.10';
+  const SCRIPT_VERSION = '1.8.11';
 
   /***************************************************************************
    * CONFIGURATION GLOBALE
@@ -54,7 +54,11 @@
       [['Santé des élèves', 'Santé mentale et bien-être des élèves'], ['6403']],
       [['Encadrement'], ['6455']],
       [['Carrière', 'Carrière et évolution professionnelle'], ['6227']],
-      [['2nd degré', 'Second degré'], ['6202']]
+      [['2nd degré', 'Second degré'], ['6202']],
+      [['Enseignants'], ['6325']],
+      [['LGT'], ['6633']],
+      [['LP Métiers', 'LP Metiers'], ['6634']],
+      [['LP Général', 'LP General'], ['6635']]
     ]
   };
 
