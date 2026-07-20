@@ -300,6 +300,7 @@
           <button id="eafc-export" class="eafc-btn secondary" type="button">Exporter les logs</button>
           <button id="eafc-export-report" class="eafc-btn secondary" type="button">Exporter bilan Excel</button>
           <button id="eafc-export-intranet-report" class="eafc-btn secondary" type="button">Exporter rapport JSON</button>
+          <button id="eafc-reset-intranet" class="eafc-btn secondary" type="button">Reset JSON maj public/contenu</button>
           <button id="eafc-reset-excel" class="eafc-btn secondary" type="button">Retirer Excel</button>
           <button id="eafc-reset-imports" class="eafc-btn danger" type="button">Reset JSON/Excel</button>
         </div>
@@ -328,6 +329,7 @@
     qs('#eafc-export').addEventListener('click', exportLogs);
     qs('#eafc-export-report').addEventListener('click', exportUpdateReportExcel);
     qs('#eafc-export-intranet-report').addEventListener('click', exportIntranetReportJson);
+    qs('#eafc-reset-intranet').addEventListener('click', resetIntranetUpdateData);
     qs('#eafc-reset-excel').addEventListener('click', resetExcelData);
     qs('#eafc-reset-imports').addEventListener('click', resetImportedData);
     qs('.eafc-toggle').addEventListener('click', () => {
@@ -433,6 +435,49 @@
     writeStoredJson(STORAGE_KEYS.excelRows, state.excelRows);
     writeStoredValue(STORAGE_KEYS.savedAt, new Date().toLocaleString('fr-FR'));
     log('info', null, `Import ${source} mémorisé : il sera restauré automatiquement après changement de page Drupal.`);
+  }
+
+
+  function resetIntranetUpdateData() {
+    if (!state.intranetUpdate.payload && !readStoredJson(STORAGE_KEYS.intranetPayload, null)) {
+      setAlert('Aucun JSON de mise à jour public/contenu n’est actuellement chargé.');
+      setStatus('Aucun JSON de mise à jour à réinitialiser.');
+      return;
+    }
+    if (!window.confirm('Réinitialiser uniquement le JSON de mise à jour public/contenu ? Le mapping JSON Sofia et l’Excel seront conservés.')) return;
+
+    state.intranetUpdate = {
+      payload: null,
+      payloadType: '',
+      payloadFileName: '',
+      normalizedTargets: [],
+      validationErrors: [],
+      validationWarnings: [],
+      preview: [],
+      reportItems: [],
+      startedAt: '',
+      finishedAt: '',
+      backupItems: [],
+      backupGenerated: false
+    };
+    state.activeWorkflow = 'sofia';
+    state.stopRequested = true;
+
+    const intranetInput = qs('#eafc-intranet-file');
+    if (intranetInput) intranetInput.value = '';
+
+    deleteStoredValue(STORAGE_KEYS.intranetPayload);
+    deleteStoredValue(STORAGE_KEYS.intranetPayloadFileName);
+    deleteStoredValue(STORAGE_KEYS.intranetBatchState);
+    deleteStoredValue(STORAGE_KEYS.intranetReport);
+    clearBatchState();
+    renderWorkflowMode();
+    renderIntranetPreview();
+    renderSummary();
+    renderErrors();
+    setAlert('JSON de mise à jour public/contenu réinitialisé. Le mapping JSON Sofia et l’Excel sont conservés.');
+    setStatus('JSON de mise à jour réinitialisé.');
+    log('warning', null, 'JSON de mise à jour public/contenu réinitialisé ; mapping JSON Sofia et Excel conservés.');
   }
 
 
