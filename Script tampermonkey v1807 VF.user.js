@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EAFC Drupal - Mise à jour parcours depuis Mapping JSON + Excel
 // @namespace    https://eafc.local/tampermonkey
-// @version      1.8.07
+// @version      1.8.08
 // @description  Met à jour des pages de parcours Drupal depuis un mapping JSON externe et un export Excel EAFC Formation Export plan et sessions.
 // @author       EAFC
 // @match        *://*/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '1.8.07';
+  const SCRIPT_VERSION = '1.8.08';
 
   /***************************************************************************
    * CONFIGURATION GLOBALE
@@ -1850,7 +1850,13 @@
     const existing = readBatchState();
     if (existing.active) return runPersistedBatchStep();
     const safe = intranet.payload.settings?.safeMode === true;
-    const summary = `${intranet.normalizedTargets.length} cible(s), workflow ${state.activeWorkflow}, simulation=${CONFIG.DRY_RUN ? 'oui' : 'non'}, auto-save=${CONFIG.AUTO_SAVE ? 'oui' : 'non'}${safe ? ', safeMode=oui (aucun enregistrement automatique)' : ''}. Continuer ?`;
+    const persistentAllowed = !CONFIG.DRY_RUN && CONFIG.AUTO_SAVE && !safe;
+    const blockingReasons = [
+      CONFIG.DRY_RUN ? 'mode simulation actif' : '',
+      !CONFIG.AUTO_SAVE ? 'enregistrement automatique désactivé' : '',
+      safe ? 'mode sécurisé du JSON actif' : ''
+    ].filter(Boolean).join(', ') || 'aucun blocage';
+    const summary = `${intranet.normalizedTargets.length} cible(s), workflow ${state.activeWorkflow}.\nSimulation : ${CONFIG.DRY_RUN ? 'oui' : 'non'}\nEnregistrement automatique : ${CONFIG.AUTO_SAVE ? 'oui' : 'non'}\nMode sécurisé du JSON : ${safe ? 'oui' : 'non'}\nModification persistante possible : ${persistentAllowed ? 'oui' : 'non'}\nBlocage éventuel : ${blockingReasons}\nContinuer ?`;
     if (!window.confirm(summary)) return;
     intranet.reportItems = []; intranet.startedAt = new Date().toISOString(); intranet.finishedAt = ''; intranet.backupItems = []; intranet.backupGenerated = false;
     persistIntranetReport();
@@ -2063,24 +2069,34 @@
   async function applyTaxonomyChanges(target) {
     const result = emptyApplyResult();
     const desiredEntries = Object.entries(target.changes || {}).filter(([field]) => TAXONOMY_FIELDS.includes(field) || (target.payloadType === 'bulk_drupal_theme_public_update' && field === 'publics'));
+    if (desiredEntries.length) log('info', target, `Node ${target.nodeId} — taxonomies demandées : ${desiredEntries.map(([field]) => field).join(', ')}`);
     for (const [originalField, request] of desiredEntries) {
       const field = resolveDrupalTargetField(target.payloadType, originalField);
       if (!['theme', 'metiersPublics', 'departements'].includes(field)) continue;
       const desired = target.payloadType === 'bulk_drupal_theme_public_update' ? normalizeTerms(request.values) : normalizeTerms(request.value);
-      const current = readTaxonomyField(field);
-      if (compareTaxonomySets(current, desired)) { unchangedField(result, originalField, current); continue; }
       try {
+        const current = readTaxonomyField(field);
+        if (field === 'theme') log('info', target, `Thématiques actuelles : ${JSON.stringify(current)}. Thématiques attendues : ${JSON.stringify(desired)}.`);
+        if (field === 'metiersPublics') log('info', target, `Publics actuels : ${JSON.stringify(current)}. Publics attendus : ${JSON.stringify(desired)}.`);
+        if (compareTaxonomySets(current, desired)) {
+          unchangedField(result, originalField, current);
+          log('success', target, `${field === 'theme' ? 'Thématiques' : 'Publics'} vérifiées avec succès.`);
+          continue;
+        }
         if (field === 'theme') await applyThematicsExpectedState(desired);
         else {
-          const labels = field === 'metiersPublics' ? ['Métiers', 'Métier', 'Publics', 'Public'] : field === 'departements' ? ['Zone géographique', 'Départements', 'Département'] : ['Tags de lieux', 'Lieux'];
-          const container = findTaxonomyContainerByLabel(labels);
-          if (!container) throw typedError('field_not_found', `Champ Drupal distinct ${field} introuvable.`);
+          const container = field === 'metiersPublics' ? findPublicTreeContainer() : findTaxonomyContainerByLabel(['Zone géographique', 'Départements', 'Département']);
+          if (!container) throw typedError('field_not_found', field === 'metiersPublics' ? 'Champ publics introuvable : #edit-field-metier-tags-wrapper absent' : `Champ Drupal distinct ${field} introuvable.`);
           await applyFancyTreeExpectedState(container, desired);
         }
         const after = readTaxonomyField(field);
         if (!compareTaxonomySets(after, desired)) throw typedError('field_not_found', `Valeur finale incorrecte pour ${originalField}.`);
         updatedField(result, originalField, current, after);
-      } catch (error) { failField(result, originalField, error.code || 'field_not_found', error.message); }
+        log('success', target, `${field === 'theme' ? 'Thématiques' : 'Publics'} vérifiées avec succès.`);
+      } catch (error) {
+        log('error', target, error.message);
+        failField(result, originalField, error.code || 'field_not_found', error.message);
+      }
     }
     return result;
   }
@@ -2108,14 +2124,11 @@
     const thematics = resolveMappedThematics({ item, exportData });
     if (!thematics.length) { log('info', item, 'Aucune thématique à ajouter.'); return []; }
     log('info', item, `Thématiques à ajouter : ${thematics.join(', ')}.`);
-    for (let index = 0; index < thematics.length; index += 1) {
-      const input = await getThematicInputByIndex(index);
-      await fillThematicAutocomplete(input, thematics[index]);
-      if (index < thematics.length - 1) {
-        const addButton = await waitForAnySelector(SELECTORS.thematicAddMore, CONFIG.MAX_WAIT_TIME);
-        await safeClick(addButton, 'Ajouter un autre élément thématique');
-        await waitForAjax();
-      }
+    let current = readTaxonomyField('theme');
+    for (const thematic of thematics) {
+      if (current.some((value) => normalizeText(value) === normalizeText(thematic))) continue;
+      await addAutocompleteTermExact(thematic);
+      current = readTaxonomyField('theme');
     }
     return thematics;
   }
@@ -2257,39 +2270,125 @@
     const wanted = labels.map(normalizeText), candidates = Array.from(document.querySelectorAll('fieldset,.form-item,.field--widget-fancytree,.js-form-wrapper'));
     return candidates.filter((container) => { const label = container.querySelector(':scope > legend, :scope > label, :scope > .fieldset-legend, :scope > .form-item__label'); return label && wanted.includes(normalizeText(label.textContent)); }).sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length)[0] || null;
   }
-  function getSelectedFancyTreeTerms(container) { return Array.from(container?.querySelectorAll('.fancytree-selected,.fancytree-active[aria-selected="true"],input[type="checkbox"]:checked') || []).map((node) => node.closest('.fancytree-node,li,label')?.querySelector('.fancytree-title')?.textContent || node.closest('label')?.textContent || node.textContent).map((label) => String(label || '').trim()).filter(Boolean); }
-  function findFancyTreeNodeExact(container, label) { const matches = Array.from(container.querySelectorAll('.fancytree-node,li')).filter((node) => normalizeText(node.querySelector('.fancytree-title,label')?.textContent || '') === normalizeText(label)); if (matches.length > 1) throw typedError('ambiguous_term', `Terme ambigu : ${label}.`); return matches[0] || null; }
-  async function expandFancyTreeAncestors(node) { const ancestors = []; for (let parent = node?.parentElement?.closest('.fancytree-node,li'); parent; parent = parent.parentElement?.closest('.fancytree-node,li')) ancestors.unshift(parent); for (const ancestor of ancestors) { const expander = ancestor.querySelector(':scope > .fancytree-expander, :scope > span > .fancytree-expander'); if (expander && !ancestor.classList.contains('fancytree-expanded')) { await clickElement(expander, 'Déplier la taxonomie'); await waitForAjax(); } } }
-  async function setFancyTreeNodeChecked(node, checked) { const checkbox = node.querySelector(':scope input[type="checkbox"],input[type="checkbox"],.fancytree-checkbox'); const selected = node.classList.contains('fancytree-selected') || checkbox?.checked || checkbox?.getAttribute('aria-checked') === 'true'; if (Boolean(selected) !== Boolean(checked)) { await clickElement(checkbox || node.querySelector('.fancytree-title,label'), `${checked ? 'Sélectionner' : 'Désélectionner'} le terme exact`); await waitForAjax(); } }
-  async function applyFancyTreeExpectedState(container, expectedTerms) {
-    const expected = normalizeTerms(expectedTerms), selected = getSelectedFancyTreeTerms(container);
-    for (const label of selected.filter((term) => !expected.some((wanted) => normalizeText(wanted) === normalizeText(term)))) { const node = findFancyTreeNodeExact(container, label); if (node) await setFancyTreeNodeChecked(node, false); }
-    for (const label of expected.filter((wanted) => !selected.some((term) => normalizeText(wanted) === normalizeText(term)))) { const node = findFancyTreeNodeExact(container, label); if (!node) throw typedError('field_not_found', `Terme de taxonomie introuvable : ${label}.`); await expandFancyTreeAncestors(node); await setFancyTreeNodeChecked(node, true); }
-    const final = getSelectedFancyTreeTerms(container); if (!compareTaxonomySets(final, expected)) throw typedError('field_not_found', 'État final du FancyTree différent de expectedAfter.'); return final;
+  function findPublicTreeContainer() {
+    return document.querySelector(SELECTORS.publicTreeWrapper[0]) || findTaxonomyContainerByLabel(['Métiers', 'Métier', 'Publics', 'Public']);
   }
+
+  function getSelectedFancyTreeTerms(container) {
+    if (!container) throw typedError('field_not_found', 'Champ publics introuvable : #edit-field-metier-tags-wrapper absent');
+    const values = [];
+    const add = (value) => { const clean = String(value || '').trim(); if (clean && !values.some((entry) => normalizeText(entry) === normalizeText(clean))) values.push(clean); };
+    Array.from(container.querySelectorAll('.fancytree-node.fancytree-selected')).forEach((node) => add(node.querySelector('.fancytree-title')?.textContent || ''));
+    Array.from(container.querySelectorAll('.fancytree-node input[type="checkbox"]:checked')).forEach((checkbox) => add(checkbox.closest('.fancytree-node')?.querySelector('.fancytree-title')?.textContent || ''));
+    return values;
+  }
+
+  function findFancyTreeNodeExact(container, label) {
+    if (!container) throw typedError('field_not_found', 'Champ publics introuvable : #edit-field-metier-tags-wrapper absent');
+    const wanted = normalizeText(label);
+    const matches = Array.from(container.querySelectorAll('.fancytree-node')).filter((node) => normalizeText(node.querySelector('.fancytree-title')?.textContent || '') === wanted);
+    if (matches.length > 1) throw typedError('ambiguous_term', `Plusieurs nœuds Fancytree portent exactement le libellé : ${label}`);
+    return matches[0] || null;
+  }
+
+  async function expandFancyTreeAncestors(node) {
+    const ancestors = [];
+    for (let li = node?.closest('li')?.parentElement?.closest('li'); li; li = li.parentElement?.closest('li')) ancestors.unshift(li);
+    for (const ancestor of ancestors) {
+      const ancestorNode = ancestor.querySelector(':scope > .fancytree-node');
+      const expander = ancestorNode?.querySelector(':scope .fancytree-expander');
+      const expanded = ancestor.classList.contains('fancytree-expanded') || ancestorNode?.classList.contains('fancytree-expanded') || ancestor.getAttribute('aria-expanded') === 'true';
+      if (expander && !expanded) { await clickElement(expander, 'Déplier la taxonomie'); await waitForAjax(); }
+    }
+  }
+
+  async function setFancyTreeNodeChecked(node, checked) {
+    const checkbox = node.querySelector('input[type="checkbox"],.fancytree-checkbox');
+    const selected = node.classList.contains('fancytree-selected') || checkbox?.checked || checkbox?.getAttribute('aria-checked') === 'true';
+    if (Boolean(selected) !== Boolean(checked)) { await clickElement(checkbox || node.querySelector('.fancytree-title'), `${checked ? 'Sélectionner' : 'Désélectionner'} le terme exact`); await waitForAjax(); }
+  }
+
+  async function applyFancyTreeExpectedState(container, expectedTerms) {
+    const expected = normalizeTerms(expectedTerms);
+    let selected = getSelectedFancyTreeTerms(container);
+    for (const label of selected.filter((term) => !expected.some((wanted) => normalizeText(wanted) === normalizeText(term)))) {
+      const node = findFancyTreeNodeExact(container, label);
+      if (node) { await expandFancyTreeAncestors(node); await setFancyTreeNodeChecked(node, false); }
+    }
+    selected = getSelectedFancyTreeTerms(container);
+    for (const label of expected.filter((wanted) => !selected.some((term) => normalizeText(wanted) === normalizeText(term)))) {
+      const node = findFancyTreeNodeExact(container, label);
+      if (!node) throw typedError('field_not_found', `Public introuvable dans Fancytree : ${label}`);
+      await expandFancyTreeAncestors(node);
+      await setFancyTreeNodeChecked(node, true);
+    }
+    const final = getSelectedFancyTreeTerms(container);
+    if (!compareTaxonomySets(final, expected)) throw typedError('field_not_found', 'État final du FancyTree différent de expectedAfter.');
+    return final;
+  }
+
   function readTaxonomyField(field) {
-    if (field === 'theme') return Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).map((input) => input.value.replace(/\s*\([^)]*\)\s*$/, '').trim()).filter(Boolean);
-    const labels = field === 'metiersPublics' ? ['Métiers', 'Métier', 'Publics', 'Public'] : field === 'departements' ? ['Zone géographique', 'Départements', 'Département'] : ['Tags de lieux', 'Lieux'];
-    const container = findTaxonomyContainerByLabel(labels); return container ? getSelectedFancyTreeTerms(container) : [];
+    if (field === 'theme') {
+      const inputs = Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible);
+      if (!inputs.length) throw typedError('field_not_found', 'Champ Thématiques Drupal introuvable.');
+      return inputs.map((input) => input.value.replace(/\s*\([^)]*\)\s*$/, '').trim()).filter(Boolean);
+    }
+    const container = field === 'metiersPublics' ? findPublicTreeContainer() : findTaxonomyContainerByLabel(['Zone géographique', 'Départements', 'Département']);
+    if (!container) throw typedError('field_not_found', field === 'metiersPublics' ? 'Champ publics introuvable : #edit-field-metier-tags-wrapper absent' : `Champ Drupal distinct ${field} introuvable.`);
+    return getSelectedFancyTreeTerms(container);
   }
   async function applyThematicsExpectedState(expectedTerms) {
-    const inputs = Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible);
-    if (!inputs.length) throw typedError('field_not_found', 'Champ Thématiques Drupal introuvable.');
-    const current = inputs.map((input) => input.value.replace(/\s*\([^)]*\)\s*$/, '').trim()).filter(Boolean);
-    for (const input of inputs.filter((entry) => entry.value && !expectedTerms.some((term) => normalizeText(term) === normalizeText(entry.value.replace(/\s*\([^)]*\)\s*$/, ''))))) {
-      const remove = input.closest('.form-item,.field-multiple-table tr')?.querySelector('input[value="Retirer"],button[aria-label*="Retirer"],input[name*="remove_button"]');
-      if (!remove) throw typedError('field_not_found', `Bouton de suppression thématique introuvable pour ${input.value}.`);
-      await clickElement(remove, 'Retirer la thématique exacte'); await waitForAjax();
+    const expected = normalizeTerms(expectedTerms);
+    let current = readTaxonomyField('theme');
+    for (const value of current.filter((entry) => !expected.some((term) => normalizeText(term) === normalizeText(entry)))) {
+      const input = findThematicInputByCurrentValue(value);
+      if (!input) throw typedError('field_not_found', `Champ thématique introuvable pour suppression : ${value}.`);
+      const row = input.closest('tr') || input.closest('.field-multiple-table') || input.closest('.form-item');
+      const remove = row?.querySelector('input[value="Retirer"],button[value="Retirer"],button[aria-label*="Retirer"],input[name*="remove_button"]');
+      if (!remove) throw typedError('field_not_found', `Bouton de suppression thématique introuvable pour ${value}.`);
+      await clickElement(remove, 'Retirer la thématique exacte');
+      await waitForAjax();
+      current = readTaxonomyField('theme');
     }
-    for (const label of expectedTerms.filter((term) => !current.some((value) => normalizeText(value) === normalizeText(term)))) await addAutocompleteTermExact(label);
+    current = readTaxonomyField('theme');
+    for (const label of expected.filter((term) => !current.some((value) => normalizeText(value) === normalizeText(term)))) {
+      await addAutocompleteTermExact(label);
+      current = readTaxonomyField('theme');
+    }
   }
+
+  function findThematicInputByCurrentValue(value) {
+    return Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible).find((input) => normalizeText(input.value.replace(/\s*\([^)]*\)\s*$/, '')) === normalizeText(value)) || null;
+  }
+
+  async function getOrCreateEmptyThematicInput() {
+    let inputs = Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible);
+    let emptyInput = inputs.find((input) => !input.value.trim());
+    if (emptyInput) return emptyInput;
+
+    const addButton = await waitForAnySelector(SELECTORS.thematicAddMore, CONFIG.MAX_WAIT_TIME);
+    await clickElement(addButton, 'Ajouter un autre élément thématique');
+    await waitForAjax();
+
+    inputs = Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible);
+    emptyInput = inputs.find((input) => !input.value.trim());
+    if (!emptyInput) throw typedError('field_not_found', 'Aucune nouvelle ligne thématique vide après le clic Ajouter un autre élément.');
+    return emptyInput;
+  }
+
   async function addAutocompleteTermExact(label) {
-    const input = Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible).find((entry) => !entry.value) || Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible).at(-1);
-    if (!input) throw typedError('field_not_found', 'Ligne vide Thématiques introuvable.');
+    const input = await getOrCreateEmptyThematicInput();
     setInputValue(input, label);
-    const suggestion = await waitForFunction(() => Array.from(document.querySelectorAll('.ui-autocomplete li,.ui-menu-item,[role="option"]')).filter(isVisible).filter((entry) => normalizeText(entry.textContent.replace(/\s*\([^)]*\)\s*$/, '')) === normalizeText(label)), CONFIG.MAX_WAIT_TIME, `Suggestion exacte introuvable : ${label}.`);
-    if (suggestion.length !== 1) throw typedError(suggestion.length > 1 ? 'ambiguous_term' : 'field_not_found', `Suggestion ${label} ambiguë ou absente.`);
-    await clickElement(suggestion[0], `Choisir la suggestion exacte ${label}`); await waitForAjax();
+    const normalizedLabel = normalizeText(label);
+    const suggestions = await waitForFunction(() => Array.from(document.querySelectorAll('.ui-autocomplete li,.ui-menu-item,[role="option"]')).filter(isVisible).filter((entry) => {
+      const full = normalizeText(entry.textContent || '');
+      const withoutId = normalizeText((entry.textContent || '').replace(/\s*\([^)]*\)\s*$/, ''));
+      return withoutId === normalizedLabel || full.includes(`(${normalizedLabel})`);
+    }), CONFIG.MAX_WAIT_TIME, `Suggestion thématique introuvable : ${label}`);
+    if (suggestions.length !== 1) throw typedError(suggestions.length > 1 ? 'ambiguous_term' : 'field_not_found', `Suggestion thématique introuvable : ${label}`);
+    await clickElement(suggestions[0], `Choisir la suggestion exacte ${label}`);
+    await waitForAjax();
+    await waitForFunction(() => normalizeText(input.value) !== normalizedLabel || !isVisible(input), 3000, `Thématique non validée par Drupal : ${label}`);
   }
 
   function readSimpleDrupalFields(target, values) {
