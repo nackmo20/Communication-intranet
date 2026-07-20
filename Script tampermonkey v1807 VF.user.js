@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EAFC Drupal - Mise à jour parcours depuis Mapping JSON + Excel
 // @namespace    https://eafc.local/tampermonkey
-// @version      1.8.08
+// @version      1.8.09
 // @description  Met à jour des pages de parcours Drupal depuis un mapping JSON externe et un export Excel EAFC Formation Export plan et sessions.
 // @author       EAFC
 // @match        *://*/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '1.8.08';
+  const SCRIPT_VERSION = '1.8.09';
 
   /***************************************************************************
    * CONFIGURATION GLOBALE
@@ -978,8 +978,24 @@
   function scheduleAutoResumeBatch() {
     const batch = readBatchState();
     if (!batch.active) return;
+
+    const workflowType = batch.workflowType || 'sofia';
+    if (workflowType !== 'sofia') {
+      const payload = state.intranetUpdate.payload;
+      if (!payload) {
+        log('warning', null, `Batch ${workflowType} abandonné : aucun payload intranet correspondant n’est chargé.`);
+        clearBatchState();
+        return;
+      }
+      if (workflowType !== state.activeWorkflow) {
+        log('warning', null, `Batch ${workflowType} abandonné : le workflow actif est ${state.activeWorkflow}.`);
+        clearBatchState();
+        return;
+      }
+    }
+
     setStatus('Batch détecté : reprise automatique…');
-    setAlert('Batch en cours restauré : reprise automatique, pas besoin de recliquer sur Démarrer.');
+    setAlert('Batch compatible restauré : reprise automatique.');
     window.setTimeout(() => runPersistedBatchStep(), 900);
   }
 
@@ -1045,8 +1061,16 @@
             }
             const readyToEdit = await ensureEditPage();
             if (!readyToEdit) return;
-            const intranetResult = workflowType === 'sofia' ? null : await updateCurrentDrupalPageFromIntranetPayload(item);
-            if (workflowType === 'sofia') await updateCurrentDrupalPage(item, item.excelData);
+            let intranetResult = null;
+            if (workflowType === 'sofia') {
+              if (state.activeWorkflow !== 'sofia') throw typedError('workflow_mismatch', `Refus du workflow Sofia : le workflow actif est ${state.activeWorkflow}.`);
+              await updateCurrentDrupalPage(item, item.excelData);
+            } else {
+              if (!state.intranetUpdate.payload) throw typedError('workflow_mismatch', 'Aucun JSON intranet chargé pour ce batch.');
+              if (workflowType !== state.activeWorkflow) throw typedError('workflow_mismatch', `Workflow du batch incompatible : ${workflowType} au lieu de ${state.activeWorkflow}.`);
+              if (item.payloadType !== state.intranetUpdate.payload.type) throw typedError('workflow_mismatch', `Type de cible incompatible : ${item.payloadType} au lieu de ${state.intranetUpdate.payload.type}.`);
+              intranetResult = await updateCurrentDrupalPageFromIntranetPayload(item);
+            }
             const nextIndex = Number(batch.index || 0) + 1;
             const hasMoreItems = nextIndex < validItems.length;
 
@@ -1679,7 +1703,7 @@
   const TAXONOMY_FIELDS = ['theme', 'metiersPublics', 'departements'];
   const CONTENT_OPERATIONS = ['add', 'replace', 'delete'];
   const THEME_PUBLIC_OPERATIONS = ['add', 'remove', 'replace', 'clear'];
-  const REPORT_STATUSES = ['success', 'partial_success', 'already_up_to_date', 'conflict', 'page_not_found', 'field_not_found', 'save_failed', 'access_denied', 'skipped', 'cancelled'];
+  const REPORT_STATUSES = ['success', 'partial_success', 'already_up_to_date', 'conflict', 'page_not_found', 'field_not_found', 'save_failed', 'access_denied', 'workflow_mismatch', 'unauthorized_field_access', 'unauthorized_field_change', 'skipped', 'cancelled'];
 
   async function handleIntranetUpdateFile(file) {
     try {
@@ -1701,6 +1725,11 @@
         setAlert(`Payload intranet invalide : ${validation.errors.length} erreur(s). Aucune modification ne sera possible.`);
         validation.errors.forEach((message) => log('error', null, message));
       } else {
+        const previousBatch = readBatchState();
+        if (previousBatch.active) log('warning', null, `Batch précédent annulé lors de l’import du nouveau JSON : ${previousBatch.workflowType || 'sofia'}.`);
+        clearBatchState();
+        state.stopRequested = false;
+        state.running = false;
         state.activeWorkflow = payload.type === 'update_drupal_pages' ? 'intranet_content' : 'intranet_taxonomy';
         writeStoredJson(STORAGE_KEYS.intranetPayload, payload);
         writeStoredValue(STORAGE_KEYS.intranetPayloadFileName, file.name);
@@ -1848,7 +1877,16 @@
       setAlert('Impossible de démarrer : importez un payload intranet valide contenant au moins une cible.'); return;
     }
     const existing = readBatchState();
-    if (existing.active) return runPersistedBatchStep();
+    if (existing.active) {
+      const existingWorkflow = existing.workflowType || 'sofia';
+      const requestedWorkflow = state.activeWorkflow;
+      if (existingWorkflow !== requestedWorkflow) {
+        log('warning', null, `Ancien batch ${existingWorkflow} annulé : le workflow demandé est ${requestedWorkflow}.`);
+        clearBatchState();
+      } else {
+        return runPersistedBatchStep();
+      }
+    }
     const safe = intranet.payload.settings?.safeMode === true;
     const persistentAllowed = !CONFIG.DRY_RUN && CONFIG.AUTO_SAVE && !safe;
     const blockingReasons = [
@@ -1874,6 +1912,7 @@
   async function updateCurrentDrupalPageFromIntranetPayload(target) {
     const report = createIntranetReportItem(target);
     try {
+      logIntranetTargetMode(target);
       if (isAccessDeniedPage()) throw typedError('access_denied', 'Accès Drupal refusé ou redirection vers la connexion.');
       const before = await readCurrentDrupalValues(target);
       report.before = before.values; report.title = before.title || target.requestedTitle || target.title || '';
@@ -1883,15 +1922,15 @@
         return report;
       }
       await ensureIntranetBackup(target, before);
-      if (target.payloadType === 'update_drupal_pages') {
+      if (hasRequestedEditorialChanges(target) || hasRequestedSimpleDrupalChanges(target)) {
         const editorial = await applyEditorialChanges(target, before.values);
         mergeApplyResult(report, editorial);
-        const taxonomy = await applyTaxonomyChanges(target, before.values);
-        mergeApplyResult(report, taxonomy);
-      } else {
+      }
+      if (hasRequestedTaxonomyChanges(target)) {
         const taxonomy = await applyTaxonomyChanges(target, before.values);
         mergeApplyResult(report, taxonomy);
       }
+      assertOnlyRequestedFieldsUpdated(target, report);
       report.after = { ...before.values, ...report.after };
       report.status = deriveReportStatus(report);
       return report;
@@ -1912,19 +1951,23 @@
 
   async function readCurrentDrupalValues(target) {
     const requestedFields = getRequestedFields(target);
-    const values = {}, titleInput = findElementBySelectors(SELECTORS.title);
-    const result = { title: titleInput?.value || '', values, fullHtml: '', thematics: [], metiersPublics: [], departements: [] };
-    if (requestedFields.includes('title') || Object.prototype.hasOwnProperty.call(target.expectedBefore || {}, 'title')) values.title = result.title;
-    const htmlFields = requestedFields.filter((field) => resolveDrupalTargetField(target.payloadType, field) === 'editorialPublics' || EDITORIAL_FIELDS.includes(field));
-    if (htmlFields.length || Object.keys(target.expectedBefore || {}).some((field) => EDITORIAL_FIELDS.includes(field))) {
+    const values = {};
+    const result = { title: target.requestedTitle || target.title || '', values, fullHtml: '', thematics: [], metiersPublics: [], departements: [] };
+    if (requestedFields.includes('title')) {
+      const titleInput = findElementBySelectors(SELECTORS.title);
+      result.title = titleInput?.value || '';
+      values.title = result.title;
+    }
+    const htmlFields = requestedFields.filter((field) => {
+      const resolved = resolveDrupalTargetField(target.payloadType, field);
+      return resolved === 'editorialPublics' || EDITORIAL_FIELDS.includes(resolved);
+    });
+    if (htmlFields.length) {
       await prepareFormationEditor(target);
       result.fullHtml = await getCurrentHtmlFromEditor();
-      Object.assign(values, extractRequestedFormationHtmlValues(result.fullHtml, [...new Set([...htmlFields, ...Object.keys(target.expectedBefore || {}).filter((field) => EDITORIAL_FIELDS.includes(field))])]));
+      Object.assign(values, extractRequestedFormationHtmlValues(result.fullHtml, htmlFields));
     }
-    const taxonomyFieldsToRead = [...new Set([
-      ...requestedFields,
-      ...Object.keys(target.expectedBefore || {})
-    ])].filter((field) => ['theme', 'thematiques', 'metiersPublics', 'departements'].includes(field) || (target.payloadType === 'bulk_drupal_theme_public_update' && field === 'publics'));
+    const taxonomyFieldsToRead = requestedFields.filter((field) => ['theme', 'thematiques', 'metiersPublics', 'departements'].includes(field) || (target.payloadType === 'bulk_drupal_theme_public_update' && field === 'publics'));
     for (const originalField of taxonomyFieldsToRead) {
       const field = resolveDrupalTargetField(target.payloadType, originalField);
       const current = readTaxonomyField(field);
@@ -1939,7 +1982,32 @@
 
   function getRequestedFields(target) { return Object.keys(target.changes || {}); }
 
+  function getResolvedRequestedFields(target) {
+    return getRequestedFields(target).map((field) => resolveDrupalTargetField(target.payloadType, field));
+  }
+
+  function hasRequestedEditorialChanges(target) {
+    return getResolvedRequestedFields(target).some((field) => field === 'editorialPublics' || EDITORIAL_FIELDS.includes(field));
+  }
+
+  function hasRequestedTaxonomyChanges(target) {
+    return getResolvedRequestedFields(target).some((field) => TAXONOMY_FIELDS.includes(field));
+  }
+
+  function hasRequestedSimpleDrupalChanges(target) {
+    return getResolvedRequestedFields(target).some((field) => ['title', 'publicationDate', 'preinscriptionStartDate', 'unpublishDate', 'preinscriptionLinks'].includes(field));
+  }
+
+  function isTaxonomyOnlyTarget(target) {
+    return hasRequestedTaxonomyChanges(target) && !hasRequestedEditorialChanges(target) && !hasRequestedSimpleDrupalChanges(target);
+  }
+
+  function logIntranetTargetMode(target, workflowType = state.activeWorkflow) {
+    log('info', target, `Node ${target.nodeId} — Payload : ${target.payloadType}; Workflow : ${workflowType}; Champs explicitement demandés : ${getRequestedFields(target).join(', ') || '(aucun)'}; Cible limitée aux taxonomies : ${isTaxonomyOnlyTarget(target) ? 'oui' : 'non'}; CKEditor autorisé : ${hasRequestedEditorialChanges(target) ? 'oui' : 'non'}; Workflow Sofia autorisé : ${workflowType === 'sofia' ? 'oui' : 'non'}.`);
+  }
+
   async function prepareFormationEditor(target) {
+    if (!hasRequestedEditorialChanges(target)) throw typedError('unauthorized_field_access', `ERREUR : tentative de modification d’un champ non demandé — ouverture de CKEditor refusée pour le Node ${target.nodeId}.`);
     await clickFormationBodyEditBeforeRichText(target);
     const format = await waitForAnySelector(SELECTORS.textFormat, CONFIG.MAX_WAIT_TIME).catch(() => null);
     if (format && format.value !== CONFIG.ADVANCED_FORMAT_VALUE) { setSelectValue(format, CONFIG.ADVANCED_FORMAT_VALUE); await waitForAjax(); }
@@ -2417,13 +2485,23 @@
 
   function compareExpectedBefore(target, current) {
     const differences = [];
+    const requestedFields = new Set(getRequestedFields(target));
     Object.entries(target.expectedBefore || {}).forEach(([field, expected]) => {
+      if (!requestedFields.has(field)) return;
       const actual = current[field];
-      const taxonomy = Array.isArray(expected) || ['theme', 'thematiques', 'metiersPublics', 'departements'].includes(resolveDrupalTargetField(target.payloadType, field)) || (target.payloadType === 'bulk_drupal_theme_public_update' && field === 'publics');
+      const resolvedField = resolveDrupalTargetField(target.payloadType, field);
+      const taxonomy = Array.isArray(expected) || ['theme', 'metiersPublics', 'departements'].includes(resolvedField);
       const same = taxonomy ? compareTaxonomySets(actual, expected) : compareTextValues(actual, expected);
       if (!same) differences.push({ field, expected, actual, code: 'conflict', message: `expectedBefore différent pour ${field}.` });
     });
     return differences;
+  }
+
+  function assertOnlyRequestedFieldsUpdated(target, report) {
+    const requested = new Set(getRequestedFields(target));
+    report.updatedFields.forEach((field) => {
+      if (!requested.has(field)) throw typedError('unauthorized_field_change', `ERREUR : tentative de modification d’un champ non demandé : ${field}.`);
+    });
   }
   function emptyApplyResult() { return { updatedFields: [], unchangedFields: [], failedFields: [], before: {}, after: {}, errors: [], verified: true }; }
   function updatedField(result, field, before, after) { if (!result.updatedFields.includes(field)) result.updatedFields.push(field); result.before[field] = before; result.after[field] = after; }
@@ -2444,7 +2522,8 @@
   function safeFilename(value) { return String(value || 'batch').replace(/[^a-z0-9._-]+/gi, '-'); }
   function buildIntranetSaveOptions(report, workflowType) {
     const safe = state.intranetUpdate.payload.settings?.safeMode === true;
-    return { workflowType, forbidden: safe || !report.updatedFields.length, conflict: report.status === 'conflict', fieldsValid: !report.failedFields.length, verified: report._verified, backupGenerated: state.intranetUpdate.backupGenerated, reason: safe ? 'Enregistrement interdit par le mode sécurisé du fichier importé.' : !report.updatedFields.length ? 'Aucun changement : enregistrement inutile.' : report.failedFields.length ? 'Enregistrement interdit : certains champs demandés sont introuvables ou non vérifiés.' : '' };
+    const unauthorized = report.status === 'unauthorized_field_change' || report.errors.some((error) => error.code === 'unauthorized_field_change' || error.code === 'unauthorized_field_access' || error.code === 'workflow_mismatch');
+    return { workflowType, forbidden: safe || unauthorized || !report.updatedFields.length, conflict: report.status === 'conflict', fieldsValid: !report.failedFields.length && !unauthorized, verified: report._verified, backupGenerated: state.intranetUpdate.backupGenerated, reason: unauthorized ? 'Enregistrement interdit : tentative de modification ou accès à un champ non demandé.' : safe ? 'Enregistrement interdit par le mode sécurisé du fichier importé.' : !report.updatedFields.length ? 'Aucun changement : enregistrement inutile.' : report.failedFields.length ? 'Enregistrement interdit : certains champs demandés sont introuvables ou non vérifiés.' : '' };
   }
   function finalizeIntranetReportItem(report, saved) {
     report.saved = Boolean(saved);
