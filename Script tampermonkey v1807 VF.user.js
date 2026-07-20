@@ -1090,6 +1090,17 @@
               saved = await saveCurrentPageIfAllowed(item, saveOptions);
               if (!saveExpected || saved === false) finalizeIntranetReportItem(intranetResult, Boolean(saved));
             }
+            const saveRequiredBeforeNextPage = workflowType === 'sofia' || Boolean(intranetResult?.updatedFields?.length);
+            if (saveRequiredBeforeNextPage && saved !== true) {
+              writeBatchState({ ...batch, phase: 'updatePage' });
+              state.running = false;
+              const message = 'Enregistrement non effectué : le batch reste sur cette fiche et ne passera pas à la page suivante avant un clic sur Enregistrer.';
+              setStatus('Enregistrement requis avant la page suivante.');
+              setAlert(message);
+              log('warning', item, message);
+              return;
+            }
+
             log('success', item, 'Traitement terminé pour ce parcours.');
 
             if (!hasMoreItems) {
