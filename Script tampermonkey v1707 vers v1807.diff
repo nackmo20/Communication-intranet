@@ -1,0 +1,870 @@
+--- Script tampermonkey v1707 VF.txt
++++ Script tampermonkey v1807 VF.user.js
+@@ -1,7 +1,7 @@
+ // ==UserScript==
+ // @name         EAFC Drupal - Mise à jour parcours depuis Mapping JSON + Excel
+ // @namespace    https://eafc.local/tampermonkey
+-// @version      1.0.37
++// @version      1.8.07
+ // @description  Met à jour des pages de parcours Drupal depuis un mapping JSON externe et un export Excel EAFC Formation Export plan et sessions.
+ // @author       EAFC
+ // @match        *://*/*
+@@ -17,7 +17,7 @@
+ (function () {
+   'use strict';
+ 
+-  const SCRIPT_VERSION = '1.0.37';
++  const SCRIPT_VERSION = '1.8.07';
+ 
+   /***************************************************************************
+    * CONFIGURATION GLOBALE
+@@ -166,6 +166,17 @@
+       'select[name*="[field_callout_color]"]',
+       'select[data-drupal-selector*="field-callout-color"]'
+     ],
++    title: [
++      'input[data-drupal-selector="edit-title-0-value"]',
++      'input#edit-title-0-value',
++      'input[name="title[0][value]"]'
++    ],
++    thematics: [
++      'input[name^="field_formation_thematic["][name$="[target_id]"]',
++      'input[data-drupal-selector^="edit-field-formation-thematic-"][data-drupal-selector$="-target-id"]',
++      'input[name*="field_thematique"]',
++      'input[name*="field_theme"]'
++    ],
+     save: [
+       'input[data-drupal-selector="edit-submit"]',
+       'input#edit-submit',
+@@ -198,7 +209,11 @@
+     savedAt: 'eafcDrupalUpdater.savedAt.v1',
+     batchState: 'eafcDrupalUpdater.batchState.v1',
+     uiConfig: 'eafcDrupalUpdater.uiConfig.v1',
+-    updateReport: 'eafcDrupalUpdater.updateReport.v1'
++    updateReport: 'eafcDrupalUpdater.updateReport.v1',
++    intranetPayload: 'eafcDrupalUpdater.intranetPayload.v1',
++    intranetPayloadFileName: 'eafcDrupalUpdater.intranetPayloadFileName.v1',
++    intranetBatchState: 'eafcDrupalUpdater.intranetBatchState.v1',
++    intranetReport: 'eafcDrupalUpdater.intranetReport.v1'
+   };
+ 
+   const state = {
+@@ -212,7 +227,13 @@
+     running: false,
+     stopRequested: false,
+     panelCollapsed: false,
+-    lastSummary: { mapping: 0, excel: 0, matches: 0, errors: 0 }
++    lastSummary: { mapping: 0, excel: 0, matches: 0, errors: 0 },
++    activeWorkflow: 'sofia',
++    intranetUpdate: {
++      payload: null, payloadType: '', payloadFileName: '', normalizedTargets: [],
++      validationErrors: [], validationWarnings: [], preview: [], reportItems: [],
++      startedAt: '', finishedAt: '', backupItems: [], backupGenerated: false
++    }
+   };
+ 
+   /***************************************************************************
+@@ -230,11 +251,15 @@
+       <div class="eafc-header"><span>Mise à jour parcours EAFC</span><span class="eafc-version">v${SCRIPT_VERSION}</span><button class="eafc-toggle" type="button">−</button></div>
+       <div class="eafc-body">
+         <input id="eafc-mapping-file" class="eafc-file" type="file" accept="application/json,.json">
++        <input id="eafc-intranet-file" class="eafc-file" type="file" accept="application/json,.json">
+         <input id="eafc-excel-file" class="eafc-file" type="file" accept=".xlsx,.xls,.xlsm,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel">
+         <div class="eafc-row">
+           <button id="eafc-import-mapping" class="eafc-btn secondary" type="button">Importer mapping JSON</button>
+           <button id="eafc-import-excel" class="eafc-btn secondary" type="button">Importer Excel</button>
++          <button id="eafc-import-intranet" class="eafc-btn secondary" type="button">Importer mises à jour intranet</button>
+         </div>
++        <div id="eafc-workflow-mode" class="eafc-alert"></div>
++        <div id="eafc-intranet-preview" class="eafc-small"></div>
+         <div class="eafc-summary" id="eafc-summary"></div>
+         <div class="eafc-options">
+           <label><input id="eafc-dry-run" type="checkbox" checked> Mode simulation</label>
+@@ -249,6 +274,7 @@
+           <button id="eafc-stop" class="eafc-btn danger" type="button">Stop</button>
+           <button id="eafc-export" class="eafc-btn secondary" type="button">Exporter les logs</button>
+           <button id="eafc-export-report" class="eafc-btn secondary" type="button">Exporter bilan Excel</button>
++          <button id="eafc-export-intranet-report" class="eafc-btn secondary" type="button">Exporter rapport JSON</button>
+           <button id="eafc-reset-imports" class="eafc-btn danger" type="button">Reset JSON/Excel</button>
+         </div>
+         <div id="eafc-errors" class="eafc-errors" hidden></div>
+@@ -260,6 +286,8 @@
+     loadPersistedUpdateReport();
+ 
+     qs('#eafc-import-mapping').addEventListener('click', () => qs('#eafc-mapping-file').click());
++    qs('#eafc-import-intranet').addEventListener('click', () => qs('#eafc-intranet-file').click());
++    qs('#eafc-intranet-file').addEventListener('change', (e) => e.target.files[0] && handleIntranetUpdateFile(e.target.files[0]));
+     qs('#eafc-import-excel').addEventListener('click', () => qs('#eafc-excel-file').click());
+     qs('#eafc-mapping-file').addEventListener('change', (e) => e.target.files[0] && handleMappingFile(e.target.files[0]));
+     qs('#eafc-excel-file').addEventListener('change', (e) => e.target.files[0] && handleExcelFile(e.target.files[0]));
+@@ -270,9 +298,10 @@
+     qs('#eafc-click-delay').addEventListener('change', (e) => { CONFIG.DELAY_BETWEEN_ACTIONS = sanitizeDelay(e.target.value); e.target.value = String(CONFIG.DELAY_BETWEEN_ACTIONS); persistUiConfig(); renderSummary(); });
+     qs('#eafc-analyze').addEventListener('click', analyzeCorrespondences);
+     qs('#eafc-start').addEventListener('click', runUpdateBatch);
+-    qs('#eafc-stop').addEventListener('click', () => { state.stopRequested = true; clearBatchState(); log('warning', null, 'Arrêt demandé par l’utilisateur.'); setStatus('Arrêt demandé…'); });
++    qs('#eafc-stop').addEventListener('click', () => { markRemainingIntranetTargetsCancelled(); state.stopRequested = true; clearBatchState(); log('warning', null, 'Arrêt demandé par l’utilisateur.'); setStatus('Arrêt demandé…'); });
+     qs('#eafc-export').addEventListener('click', exportLogs);
+     qs('#eafc-export-report').addEventListener('click', exportUpdateReportExcel);
++    qs('#eafc-export-intranet-report').addEventListener('click', exportIntranetReportJson);
+     qs('#eafc-reset-imports').addEventListener('click', resetImportedData);
+     qs('.eafc-toggle').addEventListener('click', () => {
+       state.panelCollapsed = !state.panelCollapsed;
+@@ -293,6 +322,7 @@
+       <span>Auto-save</span><strong>${CONFIG.AUTO_SAVE ? 'Oui' : 'Non'}</strong>
+       <span>Sécurité clic</span><strong>${CONFIG.SAFE_CLICK_MODE ? 'Oui' : 'Non'}</strong>
+       <span>Vitesse clics</span><strong>${CONFIG.DELAY_BETWEEN_ACTIONS} ms</strong>`;
++    renderWorkflowMode();
+   }
+ 
+   function renderErrors() {
+@@ -345,6 +375,7 @@
+     const persistedMapping = readStoredJson(STORAGE_KEYS.mappingItems, []);
+     const persistedExcelRows = readStoredJson(STORAGE_KEYS.excelRows, []);
+     const savedAt = readStoredValue(STORAGE_KEYS.savedAt, '');
++    restoreIntranetPayload();
+ 
+     if (Array.isArray(persistedMapping) && persistedMapping.length) {
+       state.mappingItems = persistedMapping;
+@@ -365,7 +396,9 @@
+       scheduleAutoResumeBatch();
+     } else {
+       renderSummary();
++      if (readBatchState().active) scheduleAutoResumeBatch();
+     }
++    renderIntranetPreview();
+   }
+ 
+   function persistImportedData(source) {
+@@ -448,6 +481,7 @@
+    ***************************************************************************/
+   async function handleMappingFile(file) {
+     try {
++      state.activeWorkflow = 'sofia';
+       const text = await file.text();
+       const parsed = parseMappingJson(text);
+       state.mappingItems = normalizeMappingItems(parsed.items || parsed);
+@@ -494,6 +528,7 @@
+    ***************************************************************************/
+   async function handleExcelFile(file) {
+     try {
++      state.activeWorkflow = 'sofia';
+       const rows = await readExcelWorkbook(file);
+       state.excelRows = normalizeExcelRows(rows);
+       state.excelIndex = buildExcelIndex(state.excelRows);
+@@ -757,6 +792,7 @@
+    ***************************************************************************/
+   async function runUpdateBatch() {
+     if (state.running) return;
++    if (state.activeWorkflow !== 'sofia') return startIntranetBatch();
+     const existingBatch = readBatchState();
+     if (existingBatch.active) {
+       log('info', null, `Reprise du batch existant à l'étape ${existingBatch.phase}, élément ${Number(existingBatch.index || 0) + 1}.`);
+@@ -776,7 +812,7 @@
+ 
+     state.updateReport = [];
+     writeStoredJson(STORAGE_KEYS.updateReport, state.updateReport);
+-    writeBatchState({ active: true, index: 0, phase: 'goToAdmin', startedAt: new Date().toISOString() });
++    writeBatchState({ active: true, index: 0, phase: 'goToAdmin', workflowType: 'sofia', startedAt: new Date().toISOString() });
+     state.stopRequested = false;
+     log('info', null, `${summary} Le batch reprendra automatiquement après chaque changement de page Drupal.`);
+     await runPersistedBatchStep();
+@@ -798,9 +834,15 @@
+ 
+     try {
+       while (!state.stopRequested) {
+-        analyzeCorrespondences(false);
+-        const validItems = state.enrichedItems.filter((item) => item.valid);
+         const batch = readBatchState();
++        const workflowType = batch.workflowType || 'sofia';
++        let validItems;
++        if (workflowType === 'sofia') {
++          analyzeCorrespondences(false);
++          validItems = state.enrichedItems.filter((entry) => entry.valid);
++        } else {
++          validItems = state.intranetUpdate.normalizedTargets;
++        }
+ 
+         if (!batch.active) break;
+         if (batch.index >= validItems.length) {
+@@ -811,6 +853,7 @@
+         }
+ 
+         const item = validItems[batch.index];
++        const itemId = workflowType === 'sofia' ? item.drupalParcoursId : item.nodeId;
+         const phase = batch.phase || 'goToAdmin';
+         log('info', item, `Reprise batch automatique : élément ${batch.index + 1}/${validItems.length}, étape ${phase}.`);
+ 
+@@ -826,7 +869,7 @@
+             // On mémorise donc l'étape suivante AVANT le clic pour éviter de recliquer
+             // en boucle sur Filtrer après le rechargement de /admin/content.
+             writeBatchState({ ...batch, phase: 'openResult' });
+-            await filterByDrupalId(item.drupalParcoursId);
++            await filterByDrupalId(itemId);
+             continue;
+           }
+ 
+@@ -845,7 +888,8 @@
+             }
+             const readyToEdit = await ensureEditPage();
+             if (!readyToEdit) return;
+-            await updateCurrentDrupalPage(item, item.excelData);
++            const intranetResult = workflowType === 'sofia' ? null : await updateCurrentDrupalPageFromIntranetPayload(item);
++            if (workflowType === 'sofia') await updateCurrentDrupalPage(item, item.excelData);
+             const nextIndex = Number(batch.index || 0) + 1;
+             const hasMoreItems = nextIndex < validItems.length;
+ 
+@@ -855,7 +899,16 @@
+             if (hasMoreItems) writeBatchState({ ...batch, index: nextIndex, phase: 'goToAdmin' });
+             else clearBatchState();
+ 
+-            await saveCurrentPageIfAllowed(item);
++            let saved = false;
++            if (workflowType === 'sofia') saved = await saveCurrentPageIfAllowed(item);
++            else {
++              const saveOptions = buildIntranetSaveOptions(intranetResult, workflowType);
++              const saveExpected = !CONFIG.DRY_RUN && CONFIG.AUTO_SAVE && !saveOptions.forbidden && !saveOptions.conflict && saveOptions.fieldsValid !== false && saveOptions.verified !== false && saveOptions.backupGenerated;
++              // Persistance avant le clic : une navigation Drupal peut détruire le contexte JavaScript immédiatement.
++              finalizeIntranetReportItem(intranetResult, saveExpected);
++              saved = await saveCurrentPageIfAllowed(item, saveOptions);
++              if (!saveExpected || saved === false) finalizeIntranetReportItem(intranetResult, Boolean(saved));
++            }
+             log('success', item, 'Traitement terminé pour ce parcours.');
+ 
+             if (!hasMoreItems) {
+@@ -878,6 +931,13 @@
+             return;
+           }
+           log('error', item, `Erreur parcours : ${error.message}. Contexte : ${captureTextContext()}`);
++          if (workflowType !== 'sofia') {
++            const failed = createIntranetReportItem(item);
++            failed.status = /accès refusé|connexion/i.test(error.message) ? 'access_denied' : /résultat|premier résultat/i.test(error.message) ? 'page_not_found' : 'field_not_found';
++            failed.failedFields = getRequestedFields(item);
++            failed.errors = [{ code: failed.status, message: error.message }];
++            finalizeIntranetReportItem(failed, false);
++          }
+           writeBatchState({ ...batch, index: batch.index + 1, phase: 'goToAdmin' });
+           await sleep(CONFIG.DELAY_BETWEEN_ACTIONS);
+         }
+@@ -893,7 +953,8 @@
+   }
+ 
+   function readBatchState() {
+-    return readStoredJson(STORAGE_KEYS.batchState, { active: false, index: 0, phase: 'goToAdmin' }) || { active: false, index: 0, phase: 'goToAdmin' };
++    const batch = readStoredJson(STORAGE_KEYS.batchState, { active: false, index: 0, phase: 'goToAdmin', workflowType: 'sofia' }) || { active: false, index: 0, phase: 'goToAdmin' };
++    return { ...batch, workflowType: batch.workflowType || 'sofia' };
+   }
+ 
+   function writeBatchState(batchState) {
+@@ -901,7 +962,7 @@
+   }
+ 
+   function clearBatchState() {
+-    writeBatchState({ active: false, index: 0, phase: 'goToAdmin' });
++    writeBatchState({ active: false, index: 0, phase: 'goToAdmin', workflowType: 'sofia' });
+   }
+ 
+   function isClickCancelledError(error) {
+@@ -1042,12 +1103,16 @@
+     recordUpdateReport(item, data, { startDate, endDate, unpublishDate });
+   }
+ 
+-  async function saveCurrentPageIfAllowed(item) {
++  async function saveCurrentPageIfAllowed(item, options = {}) {
++    if (options.forbidden || options.conflict || options.fieldsValid === false || options.verified === false || (options.workflowType && options.workflowType !== 'sofia' && !options.backupGenerated)) {
++      const msg = options.reason || 'Enregistrement intranet interdit par les contrôles de sécurité.';
++      setAlert(msg); log('warning', item, msg); return false;
++    }
+     if (CONFIG.DRY_RUN || !CONFIG.AUTO_SAVE) {
+       const msg = 'Page modifiée en mode simulation ou sans sauvegarde automatique. Vérifiez puis enregistrez manuellement.';
+       setAlert(msg);
+       log('warning', item, msg);
+-      return;
++      return false;
+     }
+ 
+     // Sécurité de séquence : le bouton Drupal "Enregistrer" ne doit être cliqué
+@@ -1059,6 +1124,7 @@
+     const save = await waitForFunction(findFinalSaveButton, CONFIG.MAX_WAIT_TIME, 'Bouton final Enregistrer introuvable.');
+     await clickElement(save, 'Enregistrer la page Drupal en tout dernier');
+     await sleep(1500);
++    return true;
+   }
+ 
+   function findFinalSaveButton() {
+@@ -1437,6 +1503,542 @@
+   }
+ 
+   /***************************************************************************
++   * MISES À JOUR INTRANET (CONTENU ET TAXONOMIES)
++   ***************************************************************************/
++  const INTRANET_PAYLOAD_TYPES = ['update_drupal_pages', 'bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'];
++  const INTRANET_FIELDS = ['title', 'objectif', 'contenu', 'accessibilite', 'miseEnPlace', 'effectif', 'dureeTotale', 'presentielH', 'distancielH', 'publics', 'prerequis', 'contact', 'theme', 'metiersPublics', 'lieux', 'departements', 'publicationDate', 'preinscriptionStartDate', 'unpublishDate', 'preinscriptionLinks'];
++  const EDITORIAL_FIELDS = ['objectif', 'contenu', 'accessibilite', 'miseEnPlace', 'effectif', 'dureeTotale', 'presentielH', 'distancielH', 'publics', 'prerequis', 'contact'];
++  const TAXONOMY_FIELDS = ['theme', 'metiersPublics', 'departements', 'lieux'];
++  const CONTENT_OPERATIONS = ['add', 'replace', 'delete'];
++  const BULK_OPERATIONS = ['add', 'remove', 'replace_all', 'replace_term', 'clean'];
++  const THEME_PUBLIC_OPERATIONS = ['add', 'remove', 'replace', 'clear'];
++  const REPORT_STATUSES = ['success', 'partial_success', 'already_up_to_date', 'conflict', 'page_not_found', 'field_not_found', 'save_failed', 'access_denied', 'skipped', 'cancelled'];
++
++  async function handleIntranetUpdateFile(file) {
++    try {
++      const payload = JSON.parse(await file.text());
++      const validation = validateIntranetPayload(payload);
++      state.intranetUpdate = {
++        ...state.intranetUpdate,
++        payload,
++        payloadType: payload?.type || '',
++        payloadFileName: file.name,
++        normalizedTargets: validation.targets,
++        validationErrors: validation.errors,
++        validationWarnings: validation.warnings,
++        preview: buildIntranetPreview(payload, validation.targets),
++        reportItems: [], startedAt: '', finishedAt: '', backupItems: [], backupGenerated: false
++      };
++      if (validation.errors.length) {
++        state.activeWorkflow = 'sofia';
++        setAlert(`Payload intranet invalide : ${validation.errors.length} erreur(s). Aucune modification ne sera possible.`);
++        validation.errors.forEach((message) => log('error', null, message));
++      } else {
++        state.activeWorkflow = payload.type === 'update_drupal_pages' ? 'intranet_content' : 'intranet_taxonomy';
++        writeStoredJson(STORAGE_KEYS.intranetPayload, payload);
++        writeStoredValue(STORAGE_KEYS.intranetPayloadFileName, file.name);
++        writeStoredJson(STORAGE_KEYS.intranetReport, buildIntranetReport());
++        const safe = payload.settings?.safeMode === true ? ' Enregistrement interdit par le mode sécurisé du fichier importé.' : '';
++        setAlert(`Payload ${payload.type} importé et validé. L’import ne déclenche aucune action Drupal.${safe}`);
++        log('success', null, `${validation.targets.length} cible(s) intranet importée(s), sans démarrage automatique.${safe}`);
++      }
++      renderWorkflowMode();
++      renderIntranetPreview();
++    } catch (error) {
++      state.intranetUpdate.validationErrors = [`JSON invalide : ${error.message}`];
++      state.activeWorkflow = 'sofia';
++      setAlert(`Import intranet refusé : JSON invalide (${error.message}).`);
++      log('error', null, `Import intranet : ${error.message}`);
++      renderWorkflowMode();
++    }
++  }
++
++  function validateIntranetPayload(payload) {
++    const errors = [], warnings = [];
++    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return { errors: ['Payload vide ou non objet.'], warnings, targets: [] };
++    if (!payload.type) errors.push('Propriété type absente.');
++    else if (!INTRANET_PAYLOAD_TYPES.includes(payload.type)) errors.push(`Type inconnu : ${payload.type}.`);
++    if (!String(payload.batchId || '').trim()) errors.push('Batch ID absent.');
++    if (payload.type === 'update_drupal_pages' && !Array.isArray(payload.items)) errors.push('Tableau items absent.');
++    if (['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(payload.type) && !Array.isArray(payload.targets)) errors.push('Tableau targets absent.');
++    const targets = normalizeIntranetTargets(payload);
++    if (!targets.length) errors.push('Aucune cible exploitable dans le payload.');
++    const seen = new Map();
++    targets.forEach((target, index) => {
++      if (!String(target.nodeId || '').trim()) errors.push(`Cible ${index + 1} : Node ID absent.`);
++      const requested = payload.type === 'update_drupal_pages' || payload.type === 'bulk_drupal_theme_public_update' ? target.changes : target.expectedAfter;
++      if (!requested || typeof requested !== 'object' || Array.isArray(requested) || !Object.keys(requested).length) errors.push(`Cible ${target.nodeId || index + 1} vide : changes/expectedAfter absent.`);
++      Object.entries(requested || {}).forEach(([field, request]) => {
++        if (!INTRANET_FIELDS.includes(field)) errors.push(`Cible ${target.nodeId}: champ inconnu ${field}.`);
++        if (payload.type === 'update_drupal_pages') {
++          if (!request || typeof request !== 'object') errors.push(`Cible ${target.nodeId}, ${field}: demande invalide.`);
++          else if (!CONTENT_OPERATIONS.includes(request.operation)) errors.push(`Cible ${target.nodeId}, ${field}: opération inconnue ${request.operation}.`);
++          if (field === 'title' && request?.operation === 'delete') errors.push(`Cible ${target.nodeId}, title: invalid_operation (le titre ne peut pas être vidé).`);
++        }
++        if (payload.type === 'bulk_drupal_theme_public_update') {
++          if (!['theme', 'publics'].includes(field)) errors.push(`Cible ${target.nodeId}: le format thématiques/publics ne reconnaît que theme et publics.`);
++          if (!request || typeof request !== 'object' || !Array.isArray(request.values)) errors.push(`Cible ${target.nodeId}, ${field}: values doit être un tableau.`);
++          else if (!THEME_PUBLIC_OPERATIONS.includes(request.operation)) errors.push(`Cible ${target.nodeId}, ${field}: opération inconnue ${request.operation}.`);
++          if (!Object.prototype.hasOwnProperty.call(target.expectedAfter || {}, field)) errors.push(`Cible ${target.nodeId}, ${field}: expectedAfter absent.`);
++        }
++        const key = `${target.nodeId}|${field}`;
++        const signature = JSON.stringify(request);
++        if (seen.has(key) && seen.get(key) !== signature) errors.push(`Doublon contradictoire pour Node ID ${target.nodeId}, champ ${field}.`);
++        seen.set(key, signature);
++      });
++    });
++    if (payload.type === 'bulk_drupal_taxonomy_update') {
++      (payload.operations || []).forEach((operation, index) => {
++        if (!['publics', 'thematiques', 'theme', 'metiersPublics', 'departements', 'lieux'].includes(operation.field)) errors.push(`Opération massive ${index + 1}: champ inconnu ${operation.field}.`);
++        if (!BULK_OPERATIONS.includes(operation.operation)) errors.push(`Opération massive ${index + 1}: opération inconnue ${operation.operation}.`);
++      });
++      if (payload.selection?.selectedCount != null && Number(payload.selection.selectedCount) !== targets.length) warnings.push(`selection.selectedCount (${payload.selection.selectedCount}) diffère du nombre de cibles (${targets.length}).`);
++    }
++    if (payload.type === 'bulk_drupal_theme_public_update' && payload.selection?.selectedCount != null && Number(payload.selection.selectedCount) !== targets.length) warnings.push(`selection.selectedCount (${payload.selection.selectedCount}) diffère du nombre de cibles (${targets.length}).`);
++    return { errors: [...new Set(errors)], warnings: [...new Set(warnings)], targets };
++  }
++
++  function normalizeIntranetTargets(payload) {
++    if (payload?.type === 'update_drupal_pages') {
++      return (payload.items || []).flatMap((item) => (item.targets || []).map((target) => ({
++        batchId: payload.batchId, payloadType: payload.type, intentionId: item.intentionId || '', dispositifCode: item.dispositifCode || '',
++        requestedTitle: item.requestedTitle || '', linkedCourses: Array.isArray(item.linkedCourses) ? item.linkedCourses : [],
++        nodeId: String(target.nodeId || '').trim(), pageUrl: target.pageUrl || '', inventorySheet: target.inventorySheet || '',
++        departmentCodes: Array.isArray(target.departmentCodes) ? target.departmentCodes : [], expectedBefore: target.expectedBefore || {}, changes: target.changes || {}
++      })));
++    }
++    if (['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(payload?.type)) return (payload.targets || []).map((target) => ({
++      batchId: payload.batchId, payloadType: payload.type, nodeId: String(target.nodeId || '').trim(), pageUrl: target.pageUrl || '',
++      title: target.title || '', requestedTitle: target.title || '', inventorySheet: target.inventorySheet || '', sourceOvp: target.sourceOvp || '',
++      expectedBefore: target.expectedBefore || {}, changes: target.changes || {}, expectedAfter: target.expectedAfter || {}, operations: payload.operations || []
++    }));
++    return [];
++  }
++
++  function buildIntranetPreview(payload, targets) {
++    return targets.map((target) => {
++      const desired = payload.type === 'update_drupal_pages'
++        ? Object.fromEntries(Object.entries(target.changes).map(([field, change]) => [field, change.value]))
++        : payload.type === 'bulk_drupal_theme_public_update'
++          ? Object.fromEntries(Object.keys(target.changes).map((field) => [field, target.expectedAfter[field]]))
++          : target.expectedAfter;
++      const destructive = payload.type === 'update_drupal_pages'
++        ? Object.values(target.changes).filter((change) => change.operation === 'delete').length
++        : payload.type === 'bulk_drupal_theme_public_update'
++          ? Object.values(target.changes).filter((change) => ['remove', 'replace', 'clear'].includes(change.operation)).length
++          : (payload.operations || []).filter((operation) => ['remove', 'replace_all', 'replace_term'].includes(operation.operation)).length;
++      return { nodeId: target.nodeId, title: target.requestedTitle || target.title || '', fields: Object.keys(desired), before: target.expectedBefore || {}, after: desired, destructive };
++    });
++  }
++
++  function restoreIntranetPayload() {
++    const payload = readStoredJson(STORAGE_KEYS.intranetPayload, null);
++    if (!payload) return;
++    const validation = validateIntranetPayload(payload);
++    state.intranetUpdate.payload = payload;
++    state.intranetUpdate.payloadType = payload.type || '';
++    state.intranetUpdate.payloadFileName = readStoredValue(STORAGE_KEYS.intranetPayloadFileName, 'payload restauré');
++    state.intranetUpdate.normalizedTargets = validation.targets;
++    state.intranetUpdate.validationErrors = validation.errors;
++    state.intranetUpdate.validationWarnings = validation.warnings;
++    state.intranetUpdate.preview = buildIntranetPreview(payload, validation.targets);
++    const persistedReport = readStoredJson(STORAGE_KEYS.intranetReport, null);
++    state.intranetUpdate.reportItems = persistedReport?.items || [];
++    state.intranetUpdate.startedAt = persistedReport?.startedAt || '';
++    state.intranetUpdate.finishedAt = persistedReport?.finishedAt || '';
++    if (!validation.errors.length) state.activeWorkflow = payload.type === 'update_drupal_pages' ? 'intranet_content' : 'intranet_taxonomy';
++  }
++
++  function renderWorkflowMode() {
++    const element = qs('#eafc-workflow-mode');
++    if (!element) return;
++    const labels = { sofia: 'Sofia-FMO : dates, lieux et préinscriptions', intranet_content: 'Mise à jour des contenus intranet', intranet_taxonomy: 'Mise à jour massive des thématiques/publics' };
++    const safe = state.intranetUpdate.payload?.settings?.safeMode === true && state.activeWorkflow !== 'sofia' ? '<br><strong>Enregistrement interdit par le mode sécurisé du fichier importé.</strong>' : '';
++    element.innerHTML = `<strong>Mode actif : ${labels[state.activeWorkflow] || labels.sofia}</strong>${safe}`;
++  }
++
++  function renderIntranetPreview() {
++    const box = qs('#eafc-intranet-preview');
++    if (!box) return;
++    const payload = state.intranetUpdate.payload;
++    if (!payload) { box.innerHTML = ''; return; }
++    const preview = state.intranetUpdate.preview;
++    const fields = preview.reduce((sum, row) => sum + row.fields.length, 0);
++    const destructive = preview.reduce((sum, row) => sum + row.destructive, 0);
++    box.innerHTML = `<details open><summary><strong>Prévisualisation intranet</strong></summary>
++      <div>Type : ${escapeHtml(payload.type)} | Batch ID : ${escapeHtml(payload.batchId || '')}</div>
++      <div>Source : ${escapeHtml(state.intranetUpdate.payloadFileName)} | Cibles : ${preview.length} | Champs : ${fields} | Erreurs : ${state.intranetUpdate.validationErrors.length} | Opérations destructives : ${destructive}</div>
++      ${preview.map((row) => `<div><strong>Node ${escapeHtml(row.nodeId)}</strong> ${escapeHtml(row.title)}<br>Champs : ${escapeHtml(row.fields.join(', '))}<br>Avant : ${escapeHtml(JSON.stringify(row.before))}<br>Cible : ${escapeHtml(JSON.stringify(row.after))}</div>`).join('')}
++      ${state.intranetUpdate.validationWarnings.map((warning) => `<div>⚠ ${escapeHtml(warning)}</div>`).join('')}</details>`;
++  }
++
++  async function startIntranetBatch() {
++    const intranet = state.intranetUpdate;
++    if (!intranet.payload || intranet.validationErrors.length || !intranet.normalizedTargets.length) {
++      setAlert('Impossible de démarrer : importez un payload intranet valide contenant au moins une cible.'); return;
++    }
++    const existing = readBatchState();
++    if (existing.active) return runPersistedBatchStep();
++    const replaceAll = intranet.payload.type === 'bulk_drupal_taxonomy_update' && (intranet.payload.operations || []).some((operation) => operation.operation === 'replace_all');
++    if (replaceAll && !CONFIG.DRY_RUN && !window.confirm('Confirmation supplémentaire : replace_all remplacera réellement tous les termes ciblés. Continuer ?')) return;
++    const safe = intranet.payload.settings?.safeMode === true;
++    const summary = `${intranet.normalizedTargets.length} cible(s), workflow ${state.activeWorkflow}, simulation=${CONFIG.DRY_RUN ? 'oui' : 'non'}, auto-save=${CONFIG.AUTO_SAVE ? 'oui' : 'non'}${safe ? ', safeMode=oui (aucun enregistrement automatique)' : ''}. Continuer ?`;
++    if (!window.confirm(summary)) return;
++    intranet.reportItems = []; intranet.startedAt = new Date().toISOString(); intranet.finishedAt = ''; intranet.backupItems = []; intranet.backupGenerated = false;
++    persistIntranetReport();
++    writeBatchState({ active: true, index: 0, phase: 'goToAdmin', workflowType: state.activeWorkflow, startedAt: intranet.startedAt });
++    state.stopRequested = false;
++    await runPersistedBatchStep();
++  }
++
++  function resolveDrupalTargetField(payloadType, fieldName) {
++    if (fieldName === 'publics') return ['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(payloadType) ? 'metiersPublics' : 'editorialPublics';
++    if (fieldName === 'thematiques') return 'theme';
++    return fieldName;
++  }
++
++  async function updateCurrentDrupalPageFromIntranetPayload(target) {
++    const report = createIntranetReportItem(target);
++    try {
++      if (isAccessDeniedPage()) throw typedError('access_denied', 'Accès Drupal refusé ou redirection vers la connexion.');
++      const before = await readCurrentDrupalValues(target);
++      report.before = before.values; report.title = before.title || target.requestedTitle || target.title || '';
++      const conflicts = compareExpectedBefore(target, before.values);
++      if (conflicts.length && state.intranetUpdate.payload.settings?.stopOnConflict === true) {
++        report.status = 'conflict'; report.failedFields = conflicts.map((entry) => entry.field); report.errors = conflicts;
++        return report;
++      }
++      await ensureIntranetBackup(target, before);
++      if (target.payloadType === 'update_drupal_pages') {
++        const editorial = await applyEditorialChanges(target, before.values);
++        mergeApplyResult(report, editorial);
++        const taxonomy = await applyTaxonomyChanges(target, before.values);
++        mergeApplyResult(report, taxonomy);
++      } else {
++        const taxonomy = await applyTaxonomyChanges(target, before.values);
++        mergeApplyResult(report, taxonomy);
++      }
++      report.after = { ...before.values, ...report.after };
++      report.status = deriveReportStatus(report);
++      return report;
++    } catch (error) {
++      const code = error.code || (/introuvable/i.test(error.message) ? 'field_not_found' : 'partial_success');
++      report.status = REPORT_STATUSES.includes(code) ? code : 'partial_success';
++      report.errors.push({ code, message: error.message });
++      return report;
++    }
++  }
++
++  function createIntranetReportItem(target) {
++    return { nodeId: String(target.nodeId || ''), pageUrl: target.pageUrl || location.href, title: target.requestedTitle || target.title || '', status: 'skipped', updatedFields: [], unchangedFields: [], failedFields: [], before: {}, after: {}, saved: false, errors: [], _verified: true, _conflict: false };
++  }
++
++  function typedError(code, message) { const error = new Error(message); error.code = code; return error; }
++  function isAccessDeniedPage() { return /\/user\/login/.test(location.pathname) || /accès refusé|access denied/i.test(document.title + ' ' + document.body.textContent.slice(0, 1000)); }
++
++  async function readCurrentDrupalValues(target) {
++    const requestedFields = getRequestedFields(target);
++    const values = {}, titleInput = findElementBySelectors(SELECTORS.title);
++    const result = { title: titleInput?.value || '', values, fullHtml: '', thematics: [], metiersPublics: [], departements: [] };
++    if (requestedFields.includes('title') || Object.prototype.hasOwnProperty.call(target.expectedBefore || {}, 'title')) values.title = result.title;
++    const htmlFields = requestedFields.filter((field) => resolveDrupalTargetField(target.payloadType, field) === 'editorialPublics' || EDITORIAL_FIELDS.includes(field));
++    if (htmlFields.length || Object.keys(target.expectedBefore || {}).some((field) => EDITORIAL_FIELDS.includes(field))) {
++      await prepareFormationEditor(target);
++      result.fullHtml = await getCurrentHtmlFromEditor();
++      Object.assign(values, extractRequestedFormationHtmlValues(result.fullHtml, [...new Set([...htmlFields, ...Object.keys(target.expectedBefore || {}).filter((field) => EDITORIAL_FIELDS.includes(field))])]));
++    }
++    for (const originalField of requestedFields.filter((field) => ['theme', 'thematiques', 'metiersPublics', 'departements', 'lieux'].includes(field) || (['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(target.payloadType) && field === 'publics'))) {
++      const field = resolveDrupalTargetField(target.payloadType, originalField);
++      const current = readTaxonomyField(field);
++      values[originalField] = current;
++      if (field === 'theme') result.thematics = current;
++      if (field === 'metiersPublics') result.metiersPublics = current;
++      if (field === 'departements') result.departements = current;
++    }
++    readSimpleDrupalFields(target, values);
++    return result;
++  }
++
++  function getRequestedFields(target) { return Object.keys(['update_drupal_pages', 'bulk_drupal_theme_public_update'].includes(target.payloadType) ? target.changes || {} : target.expectedAfter || {}); }
++
++  async function prepareFormationEditor(target) {
++    await clickFormationBodyEditBeforeRichText(target);
++    const format = await waitForAnySelector(SELECTORS.textFormat, CONFIG.MAX_WAIT_TIME).catch(() => null);
++    if (format && format.value !== CONFIG.ADVANCED_FORMAT_VALUE) { setSelectValue(format, CONFIG.ADVANCED_FORMAT_VALUE); await waitForAjax(); }
++    await openCkEditorSource();
++  }
++
++  function extractRequestedFormationHtmlValues(html, fields) {
++    const documentHtml = parseHtmlFragment(html), values = {};
++    fields.forEach((field) => {
++      if (['objectif', 'contenu', 'accessibilite', 'contact'].includes(field)) values[field] = readSectionValue(documentHtml, editorialFieldDefinition(field).label);
++      else if (field === 'miseEnPlace') values[field] = readMiseEnPlaceDescription(documentHtml);
++      else values[field] = readStructuredLineValue(documentHtml, editorialFieldDefinition(field)?.label || '');
++    });
++    return values;
++  }
++
++  async function applyEditorialChanges(target, beforeValues = {}) {
++    const result = emptyApplyResult();
++    if (target.payloadType !== 'update_drupal_pages') return result;
++    const changes = target.changes || {};
++    if (changes.title) {
++      const input = findElementBySelectors(SELECTORS.title);
++      if (!input) failField(result, 'title', 'field_not_found', 'Champ titre Drupal introuvable.');
++      else if (changes.title.operation === 'delete') failField(result, 'title', 'invalid_operation', 'Le titre Drupal ne peut pas être vidé.');
++      else {
++        const desired = applyScalarOperation(input.value, changes.title);
++        if (compareTextValues(input.value, desired)) unchangedField(result, 'title', input.value);
++        else { setInputValue(input, desired); updatedField(result, 'title', input.value, input.value); }
++      }
++    }
++    const htmlChanges = Object.fromEntries(Object.entries(changes).filter(([field]) => EDITORIAL_FIELDS.includes(field)));
++    if (Object.keys(htmlChanges).length) {
++      await prepareFormationEditor(target);
++      const currentHtml = await getCurrentHtmlFromEditor();
++      const transformed = applyRequestedFormationHtmlChanges(currentHtml, htmlChanges);
++      transformed.updatedFields.forEach((field) => updatedField(result, field, beforeValues[field], transformed.after[field]));
++      transformed.unchangedFields.forEach((field) => unchangedField(result, field, transformed.after[field]));
++      transformed.failedFields.forEach((field) => failField(result, field, 'field_not_found', `Section ou ligne HTML introuvable pour ${field}.`));
++      if (transformed.html !== currentHtml) await setHtmlInEditor(transformed.html);
++    }
++    await applySimpleDrupalChanges(target, result, beforeValues);
++    return result;
++  }
++
++  function applyRequestedFormationHtmlChanges(html, changes) {
++    const documentHtml = parseHtmlFragment(html), result = { html: String(html || ''), updatedFields: [], unchangedFields: [], failedFields: [], after: {} };
++    Object.entries(changes || {}).forEach(([field, change]) => {
++      const definition = editorialFieldDefinition(field);
++      if (!definition) return;
++      let outcome;
++      if (definition.kind === 'section') outcome = mutateSectionValue(documentHtml, definition.label, change);
++      else if (definition.kind === 'description') outcome = mutateMiseEnPlaceDescription(documentHtml, change);
++      else outcome = mutateStructuredLine(documentHtml, definition.label, change);
++      if (!outcome.found) result.failedFields.push(field);
++      else if (!outcome.changed) result.unchangedFields.push(field);
++      else result.updatedFields.push(field);
++      result.after[field] = outcome.value;
++    });
++    result.html = documentHtml.body.innerHTML.trim();
++    return result;
++  }
++
++  function parseHtmlFragment(html) { return new DOMParser().parseFromString(`<body>${String(html || '')}</body>`, 'text/html'); }
++  function normalizedHtmlLabel(element) { return normalizeText(element?.textContent || '').replace(/\s*:\s*$/, ''); }
++  function editorialFieldDefinition(field) {
++    return {
++      objectif: { kind: 'section', label: 'Objectif général du parcours' }, contenu: { kind: 'section', label: 'Contenu de la formation' },
++      accessibilite: { kind: 'section', label: 'Accessibilité de la formation' }, contact: { kind: 'section', label: 'Contact de la formation' },
++      miseEnPlace: { kind: 'description', label: 'Mise en place de la formation' }, effectif: { kind: 'line', label: 'Effectif' },
++      dureeTotale: { kind: 'line', label: 'Durée totale du parcours' }, presentielH: { kind: 'line', label: 'Durée du présentiel' },
++      distancielH: { kind: 'line', label: 'Durée du distanciel' }, publics: { kind: 'line', label: 'Public concerné' }, prerequis: { kind: 'line', label: 'Prérequis du parcours' }
++    }[field] || null;
++  }
++  function findHeading(documentHtml, label) { const wanted = normalizeText(label); return Array.from(documentHtml.querySelectorAll('h2,h3')).find((heading) => normalizedHtmlLabel(heading) === wanted) || null; }
++  function sectionElements(heading) { const elements = []; if (!heading) return elements; for (let node = heading.nextElementSibling; node && !/^H[23]$/.test(node.tagName); node = node.nextElementSibling) elements.push(node); return elements; }
++  function readSectionValue(documentHtml, label) { return sectionElements(findHeading(documentHtml, label)).map((element) => element.textContent.trim()).filter(Boolean).join('\n'); }
++  function applyScalarOperation(current, change) {
++    const value = String(change?.value ?? '');
++    if (change.operation === 'delete') return '';
++    if (change.operation === 'add') {
++      if (!value || normalizeText(current).includes(normalizeText(value))) return String(current || '');
++      return current ? `${current}\n${value}` : value;
++    }
++    return value;
++  }
++  function mutateSectionValue(documentHtml, label, change) {
++    const heading = findHeading(documentHtml, label); if (!heading) return { found: false, changed: false, value: '' };
++    const elements = sectionElements(heading), current = elements.map((element) => element.textContent.trim()).filter(Boolean).join('\n');
++    const desired = applyScalarOperation(current, change);
++    if (compareTextValues(current, desired)) return { found: true, changed: false, value: current };
++    if (change.operation === 'add' && elements.length) { const paragraph = documentHtml.createElement('p'); paragraph.textContent = String(change.value ?? ''); elements.at(-1).after(paragraph); }
++    else if (elements.length) { elements[0].innerHTML = escapeHtml(desired).replace(/\n/g, '<br>'); elements.slice(1).forEach((element) => element.remove()); }
++    else { const paragraph = documentHtml.createElement('p'); paragraph.textContent = desired; heading.after(paragraph); }
++    return { found: true, changed: true, value: desired };
++  }
++  function findStructuredLine(documentHtml, label) {
++    const wanted = normalizeText(label);
++    const heading = findHeading(documentHtml, 'Mise en place de la formation');
++    return sectionElements(heading).flatMap((element) => [element, ...element.querySelectorAll('li,p')]).find((element) => {
++      const strong = element.querySelector('strong,b');
++      const candidate = normalizedHtmlLabel(strong || element).split(':')[0].trim();
++      return candidate === wanted || normalizeText(element.textContent).replace(/\s*:.*/, '') === wanted;
++    }) || null;
++  }
++  function readStructuredLineValue(documentHtml, label) { const line = findStructuredLine(documentHtml, label); if (!line) return ''; const clone = line.cloneNode(true); clone.querySelector('strong,b')?.remove(); return clone.textContent.replace(/^\s*:\s*/, '').trim(); }
++  function mutateStructuredLine(documentHtml, label, change) {
++    const line = findStructuredLine(documentHtml, label); if (!line) return { found: false, changed: false, value: '' };
++    const current = readStructuredLineValue(documentHtml, label), desired = applyScalarOperation(current, change);
++    if (compareTextValues(current, desired)) return { found: true, changed: false, value: current };
++    const marker = line.querySelector('strong,b');
++    if (marker) { while (marker.nextSibling) marker.nextSibling.remove(); marker.after(documentHtml.createTextNode(` : ${desired}`)); }
++    else line.textContent = `${label} : ${desired}`;
++    return { found: true, changed: true, value: desired };
++  }
++  function readMiseEnPlaceDescription(documentHtml) { const candidates = sectionElements(findHeading(documentHtml, 'Mise en place de la formation')).filter((element) => element.tagName === 'P' && !/:/.test(element.textContent) && !/^session\s+\d+/i.test(element.textContent.trim())); return candidates.length === 1 ? candidates[0].textContent.trim() : ''; }
++  function mutateMiseEnPlaceDescription(documentHtml, change) {
++    const candidates = sectionElements(findHeading(documentHtml, 'Mise en place de la formation')).filter((element) => element.tagName === 'P' && !/:/.test(element.textContent) && !/^session\s+\d+/i.test(element.textContent.trim()));
++    if (candidates.length !== 1) return { found: false, changed: false, value: '' };
++    const current = candidates[0].textContent.trim(), desired = applyScalarOperation(current, change);
++    if (compareTextValues(current, desired)) return { found: true, changed: false, value: current };
++    if (change.operation === 'add' && current) { const paragraph = documentHtml.createElement('p'); paragraph.textContent = String(change.value ?? ''); candidates[0].after(paragraph); }
++    else candidates[0].textContent = desired;
++    return { found: true, changed: true, value: desired };
++  }
++  function compareTextValues(a, b) { return String(a ?? '').replace(/[\s\u00a0]+/g, ' ').trim() === String(b ?? '').replace(/[\s\u00a0]+/g, ' ').trim(); }
++
++  async function applyTaxonomyChanges(target) {
++    const result = emptyApplyResult();
++    const desiredEntries = target.payloadType === 'bulk_drupal_taxonomy_update'
++      ? Object.entries(target.expectedAfter || {})
++      : Object.entries(target.changes || {}).filter(([field]) => TAXONOMY_FIELDS.includes(field) || (target.payloadType === 'bulk_drupal_theme_public_update' && field === 'publics'));
++    for (const [originalField, request] of desiredEntries) {
++      const field = resolveDrupalTargetField(target.payloadType, originalField);
++      if (!['theme', 'metiersPublics', 'departements', 'lieux'].includes(field)) continue;
++      const desired = ['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(target.payloadType) ? normalizeTerms(target.expectedAfter?.[originalField]) : normalizeTerms(request.value);
++      const current = readTaxonomyField(field);
++      if (compareTaxonomySets(current, desired)) { unchangedField(result, originalField, current); continue; }
++      try {
++        if (field === 'theme') await applyThematicsExpectedState(desired);
++        else {
++          const labels = field === 'metiersPublics' ? ['Métiers', 'Métier', 'Publics', 'Public'] : field === 'departements' ? ['Zone géographique', 'Départements', 'Département'] : ['Tags de lieux', 'Lieux'];
++          const container = findTaxonomyContainerByLabel(labels);
++          if (!container) throw typedError('field_not_found', `Champ Drupal distinct ${field} introuvable.`);
++          await applyFancyTreeExpectedState(container, desired);
++        }
++        const after = readTaxonomyField(field);
++        if (!compareTaxonomySets(after, desired)) throw typedError('field_not_found', `Valeur finale incorrecte pour ${originalField}.`);
++        updatedField(result, originalField, current, after);
++      } catch (error) { failField(result, originalField, error.code || 'field_not_found', error.message); }
++    }
++    return result;
++  }
++
++  function normalizeTerms(value) { return (Array.isArray(value) ? value : String(value ?? '').split(/[;,|\n]/)).map((term) => typeof term === 'object' ? String(term.label || term.name || '') : String(term)).map((term) => term.trim()).filter(Boolean); }
++  function normalizedTaxonomySet(terms) { return [...new Set(normalizeTerms(terms).map(normalizeText))].sort(); }
++  function compareTaxonomySets(a, b) { return JSON.stringify(normalizedTaxonomySet(a)) === JSON.stringify(normalizedTaxonomySet(b)); }
++  function findTaxonomyContainerByLabel(labels) {
++    const wanted = labels.map(normalizeText), candidates = Array.from(document.querySelectorAll('fieldset,.form-item,.field--widget-fancytree,.js-form-wrapper'));
++    return candidates.filter((container) => { const label = container.querySelector(':scope > legend, :scope > label, :scope > .fieldset-legend, :scope > .form-item__label'); return label && wanted.includes(normalizeText(label.textContent)); }).sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length)[0] || null;
++  }
++  function getSelectedFancyTreeTerms(container) { return Array.from(container?.querySelectorAll('.fancytree-selected,.fancytree-active[aria-selected="true"],input[type="checkbox"]:checked') || []).map((node) => node.closest('.fancytree-node,li,label')?.querySelector('.fancytree-title')?.textContent || node.closest('label')?.textContent || node.textContent).map((label) => String(label || '').trim()).filter(Boolean); }
++  function findFancyTreeNodeExact(container, label) { const matches = Array.from(container.querySelectorAll('.fancytree-node,li')).filter((node) => normalizeText(node.querySelector('.fancytree-title,label')?.textContent || '') === normalizeText(label)); if (matches.length > 1) throw typedError('ambiguous_term', `Terme ambigu : ${label}.`); return matches[0] || null; }
++  async function expandFancyTreeAncestors(node) { const ancestors = []; for (let parent = node?.parentElement?.closest('.fancytree-node,li'); parent; parent = parent.parentElement?.closest('.fancytree-node,li')) ancestors.unshift(parent); for (const ancestor of ancestors) { const expander = ancestor.querySelector(':scope > .fancytree-expander, :scope > span > .fancytree-expander'); if (expander && !ancestor.classList.contains('fancytree-expanded')) { await clickElement(expander, 'Déplier la taxonomie'); await waitForAjax(); } } }
++  async function setFancyTreeNodeChecked(node, checked) { const checkbox = node.querySelector(':scope input[type="checkbox"],input[type="checkbox"],.fancytree-checkbox'); const selected = node.classList.contains('fancytree-selected') || checkbox?.checked || checkbox?.getAttribute('aria-checked') === 'true'; if (Boolean(selected) !== Boolean(checked)) { await clickElement(checkbox || node.querySelector('.fancytree-title,label'), `${checked ? 'Sélectionner' : 'Désélectionner'} le terme exact`); await waitForAjax(); } }
++  async function applyFancyTreeExpectedState(container, expectedTerms) {
++    const expected = normalizeTerms(expectedTerms), selected = getSelectedFancyTreeTerms(container);
++    for (const label of selected.filter((term) => !expected.some((wanted) => normalizeText(wanted) === normalizeText(term)))) { const node = findFancyTreeNodeExact(container, label); if (node) await setFancyTreeNodeChecked(node, false); }
++    for (const label of expected.filter((wanted) => !selected.some((term) => normalizeText(wanted) === normalizeText(term)))) { const node = findFancyTreeNodeExact(container, label); if (!node) throw typedError('field_not_found', `Terme de taxonomie introuvable : ${label}.`); await expandFancyTreeAncestors(node); await setFancyTreeNodeChecked(node, true); }
++    const final = getSelectedFancyTreeTerms(container); if (!compareTaxonomySets(final, expected)) throw typedError('field_not_found', 'État final du FancyTree différent de expectedAfter.'); return final;
++  }
++  function readTaxonomyField(field) {
++    if (field === 'theme') return Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).map((input) => input.value.replace(/\s*\([^)]*\)\s*$/, '').trim()).filter(Boolean);
++    const labels = field === 'metiersPublics' ? ['Métiers', 'Métier', 'Publics', 'Public'] : field === 'departements' ? ['Zone géographique', 'Départements', 'Département'] : ['Tags de lieux', 'Lieux'];
++    const container = findTaxonomyContainerByLabel(labels); return container ? getSelectedFancyTreeTerms(container) : [];
++  }
++  async function applyThematicsExpectedState(expectedTerms) {
++    const inputs = Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible);
++    if (!inputs.length) throw typedError('field_not_found', 'Champ Thématiques Drupal introuvable.');
++    const current = inputs.map((input) => input.value.replace(/\s*\([^)]*\)\s*$/, '').trim()).filter(Boolean);
++    for (const input of inputs.filter((entry) => entry.value && !expectedTerms.some((term) => normalizeText(term) === normalizeText(entry.value.replace(/\s*\([^)]*\)\s*$/, ''))))) {
++      const remove = input.closest('.form-item,.field-multiple-table tr')?.querySelector('input[value="Retirer"],button[aria-label*="Retirer"],input[name*="remove_button"]');
++      if (!remove) throw typedError('field_not_found', `Bouton de suppression thématique introuvable pour ${input.value}.`);
++      await clickElement(remove, 'Retirer la thématique exacte'); await waitForAjax();
++    }
++    for (const label of expectedTerms.filter((term) => !current.some((value) => normalizeText(value) === normalizeText(term)))) await addAutocompleteTermExact(label);
++  }
++  async function addAutocompleteTermExact(label) {
++    const input = Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible).find((entry) => !entry.value) || Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible).at(-1);
++    if (!input) throw typedError('field_not_found', 'Ligne vide Thématiques introuvable.');
++    setInputValue(input, label);
++    const suggestion = await waitForFunction(() => Array.from(document.querySelectorAll('.ui-autocomplete li,.ui-menu-item,[role="option"]')).filter(isVisible).filter((entry) => normalizeText(entry.textContent.replace(/\s*\([^)]*\)\s*$/, '')) === normalizeText(label)), CONFIG.MAX_WAIT_TIME, `Suggestion exacte introuvable : ${label}.`);
++    if (suggestion.length !== 1) throw typedError(suggestion.length > 1 ? 'ambiguous_term' : 'field_not_found', `Suggestion ${label} ambiguë ou absente.`);
++    await clickElement(suggestion[0], `Choisir la suggestion exacte ${label}`); await waitForAjax();
++  }
++
++  function readSimpleDrupalFields(target, values) {
++    const map = { publicationDate: SELECTORS.startDate, preinscriptionStartDate: SELECTORS.startDate, unpublishDate: SELECTORS.unpublishDate };
++    getRequestedFields(target).forEach((field) => { if (map[field]) values[field] = findElementBySelectors(map[field])?.value || ''; });
++    if (getRequestedFields(target).includes('preinscriptionLinks')) values.preinscriptionLinks = Array.from(document.querySelectorAll(SELECTORS.calloutUri.join(','))).map((input) => input.value).filter(Boolean);
++    if (getRequestedFields(target).includes('lieux') && !Object.prototype.hasOwnProperty.call(values, 'lieux')) values.lieux = [];
++  }
++  async function applySimpleDrupalChanges(target, result, beforeValues) {
++    const map = { publicationDate: SELECTORS.startDate, preinscriptionStartDate: SELECTORS.startDate, unpublishDate: SELECTORS.unpublishDate };
++    for (const [field, selectors] of Object.entries(map)) {
++      const change = target.changes?.[field]; if (!change) continue;
++      const input = findElementBySelectors(selectors); if (!input) { failField(result, field, 'field_not_found', `Champ ${field} introuvable.`); continue; }
++      const desired = applyScalarOperation(input.value, change);
++      if (compareTextValues(input.value, desired)) unchangedField(result, field, input.value); else { const old = input.value; setInputValue(input, desired); updatedField(result, field, old, input.value); }
++    }
++    if (target.changes?.preinscriptionLinks) {
++      const desired = normalizeTerms(target.changes.preinscriptionLinks.value);
++      let inputs = Array.from(document.querySelectorAll(SELECTORS.calloutUri.join(','))).filter(isVisible);
++      if (!inputs.length && desired.length && target.changes.preinscriptionLinks.operation !== 'delete') { await createCallout({ preinscriptionLink: desired[0] }); inputs = Array.from(document.querySelectorAll(SELECTORS.calloutUri.join(','))).filter(isVisible); }
++      if (!inputs.length) failField(result, 'preinscriptionLinks', 'field_not_found', 'Bloc/lien de préinscription introuvable.');
++      else if (compareTaxonomySets(inputs.map((input) => input.value), desired)) unchangedField(result, 'preinscriptionLinks', desired);
++      else { const old = inputs.map((input) => input.value); setInputValue(inputs[0], desired[0] || ''); updatedField(result, 'preinscriptionLinks', old, desired); }
++    }
++  }
++
++  function compareExpectedBefore(target, current) {
++    const differences = [];
++    Object.entries(target.expectedBefore || {}).forEach(([field, expected]) => {
++      const actual = current[field];
++      const taxonomy = Array.isArray(expected) || ['theme', 'thematiques', 'metiersPublics', 'departements', 'lieux'].includes(resolveDrupalTargetField(target.payloadType, field)) || (['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(target.payloadType) && field === 'publics');
++      const same = taxonomy ? compareTaxonomySets(actual, expected) : compareTextValues(actual, expected);
++      if (!same) differences.push({ field, expected, actual, code: 'conflict', message: `expectedBefore différent pour ${field}.` });
++    });
++    return differences;
++  }
++  function emptyApplyResult() { return { updatedFields: [], unchangedFields: [], failedFields: [], before: {}, after: {}, errors: [], verified: true }; }
++  function updatedField(result, field, before, after) { if (!result.updatedFields.includes(field)) result.updatedFields.push(field); result.before[field] = before; result.after[field] = after; }
++  function unchangedField(result, field, value) { if (!result.unchangedFields.includes(field)) result.unchangedFields.push(field); result.before[field] = value; result.after[field] = value; }
++  function failField(result, field, code, message) { if (!result.failedFields.includes(field)) result.failedFields.push(field); result.errors.push({ field, code, message }); result.verified = false; }
++  function mergeApplyResult(report, result) { ['updatedFields', 'unchangedFields', 'failedFields'].forEach((key) => { report[key] = [...new Set([...report[key], ...result[key]])]; }); Object.assign(report.before, result.before); Object.assign(report.after, result.after); report.errors.push(...result.errors); report._verified = report._verified && result.verified; }
++  function deriveReportStatus(report) { if (report.failedFields.length && report.updatedFields.length) return 'partial_success'; if (report.failedFields.length) return 'field_not_found'; if (!report.updatedFields.length) return 'already_up_to_date'; return 'success'; }
++
++  async function ensureIntranetBackup(target, before) {
++    const intranet = state.intranetUpdate;
++    intranet.backupItems.push({ nodeId: target.nodeId, title: before.title, url: target.pageUrl || location.href, html: before.fullHtml, thematiques: before.thematics, metiersPublics: before.metiersPublics, departements: before.departements, requestedValues: before.values, readAt: new Date().toISOString() });
++    const savingPossible = !CONFIG.DRY_RUN && CONFIG.AUTO_SAVE && intranet.payload.settings?.safeMode !== true;
++    if (!savingPossible) return;
++    const backup = { type: 'drupal_pre_update_backup', version: '1.0', batchId: intranet.payload.batchId, generatedAt: new Date().toISOString(), restorationAutomatic: false, items: intranet.backupItems };
++    downloadFile(`eafc-backup-drupal-avant-maj-${safeFilename(intranet.payload.batchId)}.json`, JSON.stringify(backup, null, 2), 'application/json');
++    intranet.backupGenerated = true;
++  }
++  function safeFilename(value) { return String(value || 'batch').replace(/[^a-z0-9._-]+/gi, '-'); }
++  function buildIntranetSaveOptions(report, workflowType) {
++    const safe = state.intranetUpdate.payload.settings?.safeMode === true;
++    return { workflowType, forbidden: safe || !report.updatedFields.length, conflict: report.status === 'conflict', fieldsValid: !report.failedFields.length, verified: report._verified, backupGenerated: state.intranetUpdate.backupGenerated, reason: safe ? 'Enregistrement interdit par le mode sécurisé du fichier importé.' : !report.updatedFields.length ? 'Aucun changement : enregistrement inutile.' : report.failedFields.length ? 'Enregistrement interdit : certains champs demandés sont introuvables ou non vérifiés.' : '' };
++  }
++  function finalizeIntranetReportItem(report, saved) {
++    report.saved = Boolean(saved);
++    if (!saved && report.status === 'success' && !CONFIG.DRY_RUN && CONFIG.AUTO_SAVE && state.intranetUpdate.payload.settings?.safeMode !== true) report.status = 'save_failed';
++    delete report._verified; delete report._conflict;
++    const others = state.intranetUpdate.reportItems.filter((item) => String(item.nodeId) !== String(report.nodeId));
++    state.intranetUpdate.reportItems = [...others, report];
++    state.intranetUpdate.finishedAt = new Date().toISOString();
++    recordIntranetExcelReport(report);
++    persistIntranetReport();
++  }
++  function markRemainingIntranetTargetsCancelled() {
++    const batch = readBatchState();
++    if (!batch.active || (batch.workflowType || 'sofia') === 'sofia') return;
++    const completed = new Set(state.intranetUpdate.reportItems.map((item) => String(item.nodeId)));
++    state.intranetUpdate.normalizedTargets.slice(Number(batch.index || 0)).forEach((target) => {
++      if (completed.has(String(target.nodeId))) return;
++      const report = createIntranetReportItem(target); report.status = 'cancelled'; report.failedFields = getRequestedFields(target); report.errors = [{ code: 'cancelled', message: 'Arrêt demandé par l’utilisateur.' }];
++      state.intranetUpdate.reportItems.push(report);
++    });
++    state.intranetUpdate.finishedAt = new Date().toISOString(); persistIntranetReport();
++  }
++  function persistIntranetReport() { writeStoredJson(STORAGE_KEYS.intranetReport, buildIntranetReport()); }
++  function buildIntranetReport() { return { type: 'drupal_update_report', version: '1.0', batchId: state.intranetUpdate.payload?.batchId || '', sourcePayloadType: state.intranetUpdate.payloadType || '', generatedAt: new Date().toISOString(), startedAt: state.intranetUpdate.startedAt || '', finishedAt: state.intranetUpdate.finishedAt || '', items: state.intranetUpdate.reportItems.map(({ _verified, _conflict, ...item }) => item) }; }
++  function exportIntranetReportJson() { if (!state.intranetUpdate.payload) { setAlert('Aucun payload intranet : aucun rapport JSON à exporter.'); return; } const report = buildIntranetReport(); downloadFile(`eafc-rapport-drupal-${safeFilename(report.batchId)}.json`, JSON.stringify(report, null, 2), 'application/json'); }
++  function recordIntranetExcelReport(report) { loadPersistedUpdateReport(); const entry = { intranet: true, dateMiseAJour: new Date().toLocaleString('fr-FR'), batchId: state.intranetUpdate.payload?.batchId || '', payloadType: state.intranetUpdate.payloadType, drupalParcoursId: report.nodeId, drupalTitle: report.title, status: report.status, updatedFields: report.updatedFields.join(', '), unchangedFields: report.unchangedFields.join(', '), failedFields: report.failedFields.join(', '), before: JSON.stringify(report.before), after: JSON.stringify(report.after), saved: report.saved ? 'Oui' : 'Non', errorMessage: report.errors.map((error) => error.message || error.code || error).join(' | ') }; state.updateReport = [...state.updateReport.filter((row) => !(row.intranet && row.batchId === entry.batchId && String(row.drupalParcoursId) === String(entry.drupalParcoursId))), entry]; writeStoredJson(STORAGE_KEYS.updateReport, state.updateReport); }
++
++  /***************************************************************************
+    * BILAN EXCEL DES MISES À JOUR
+    ***************************************************************************/
+   function loadPersistedUpdateReport() {
+@@ -1483,21 +2085,18 @@
+     }
+     if (!window.XLSX) throw new Error('SheetJS XLSX non chargé : export Excel impossible.');
+ 
+-    const rows = state.updateReport.map((row) => ({
+-      'Date de mise à jour': row.dateMiseAJour,
+-      'ID parcours Drupal': row.drupalParcoursId,
+-      'Titre Drupal': row.drupalTitle,
+-      'Dispositif': row.dispositifCode,
+-      'Module': row.moduleCode,
+-      'Nombre de places restantes': row.placesRestantes,
+-      'Nombre inscrits': row.preinscritsTotal,
+-      'Nombre maximal': row.preinscritsMax,
+-      'Lien de préinscription': row.lienPreinscription,
+-      'Date début saisie': row.dateDebutSaisie,
+-      'Date fin saisie': row.dateFinSaisie,
+-      'Date dépublication saisie': row.dateDepublicationSaisie,
+-      'Sessions saisies': row.sessionsSaisies
+-    }));
++    const rows = state.updateReport.map((row) => row.intranet ? {
++      'Date de mise à jour': row.dateMiseAJour, 'ID parcours Drupal': row.drupalParcoursId, 'Titre Drupal': row.drupalTitle,
++      'Batch ID': row.batchId, 'Type de payload': row.payloadType, 'Statut': row.status, 'Champs modifiés': row.updatedFields,
++      'Champs inchangés': row.unchangedFields, 'Champs en erreur': row.failedFields, 'Ancienne valeur': row.before,
++      'Nouvelle valeur': row.after, 'Enregistrement effectué': row.saved, 'Message d’erreur': row.errorMessage
++    } : {
++      'Date de mise à jour': row.dateMiseAJour, 'ID parcours Drupal': row.drupalParcoursId, 'Titre Drupal': row.drupalTitle,
++      'Dispositif': row.dispositifCode, 'Module': row.moduleCode, 'Nombre de places restantes': row.placesRestantes,
++      'Nombre inscrits': row.preinscritsTotal, 'Nombre maximal': row.preinscritsMax, 'Lien de préinscription': row.lienPreinscription,
++      'Date début saisie': row.dateDebutSaisie, 'Date fin saisie': row.dateFinSaisie,
++      'Date dépublication saisie': row.dateDepublicationSaisie, 'Sessions saisies': row.sessionsSaisies
++    });
+ 
+     const workbook = XLSX.utils.book_new();
+     const sheet = XLSX.utils.json_to_sheet(rows);
