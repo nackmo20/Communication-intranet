@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EAFC Drupal - Mise à jour parcours depuis Mapping JSON + Excel
 // @namespace    https://eafc.local/tampermonkey
-// @version      1.8.09
+// @version      1.8.10
 // @description  Met à jour des pages de parcours Drupal depuis un mapping JSON externe et un export Excel EAFC Formation Export plan et sessions.
 // @author       EAFC
 // @match        *://*/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '1.8.09';
+  const SCRIPT_VERSION = '1.8.10';
 
   /***************************************************************************
    * CONFIGURATION GLOBALE
@@ -1760,7 +1760,7 @@
       if (!Array.isArray(payload.items)) errors.push('items[] est obligatoire.');
     }
     if (payload.type === 'bulk_drupal_theme_public_update') {
-      if (payload.version !== '1.0') errors.push('Version bulk_drupal_theme_public_update non prise en charge.');
+      if (!['1.0', '1.1'].includes(String(payload.version || ''))) errors.push('Version bulk_drupal_theme_public_update non prise en charge.');
       if (!Array.isArray(payload.targets)) errors.push('targets[] est obligatoire.');
     }
     const targets = normalizeIntranetTargets(payload);
@@ -1782,14 +1782,18 @@
           if (field === 'title' && request?.operation === 'delete') errors.push(`Cible ${target.nodeId}, title: invalid_operation (le titre ne peut pas être vidé).`);
         }
         if (payload.type === 'bulk_drupal_theme_public_update') {
-          if (!['theme', 'publics'].includes(field)) errors.push(`Cible ${target.nodeId}: le format thématiques/publics ne reconnaît que theme et publics.`);
+          if (!['theme', 'metiersPublics', 'publics'].includes(field)) errors.push(`Cible ${target.nodeId}: le format thématiques/publics ne reconnaît que theme, metiersPublics et publics legacy.`);
           if (!request || typeof request !== 'object' || !Array.isArray(request.values)) errors.push(`Cible ${target.nodeId}, ${field}: values doit être un tableau.`);
           else {
             if (!THEME_PUBLIC_OPERATIONS.includes(request.operation)) errors.push(`Cible ${target.nodeId}, ${field}: opération inconnue ${request.operation}.`);
             if (Object.prototype.hasOwnProperty.call(request, 'value')) errors.push(`Cible ${target.nodeId}, ${field}: value est interdit pour bulk_drupal_theme_public_update.`);
           }
-          if (!Array.isArray(target.expectedAfter?.[field])) errors.push(`Cible ${target.nodeId}, ${field}: expectedAfter doit être un tableau.`);
-          else if (request?.values && !compareTaxonomySets(request.values, target.expectedAfter[field])) errors.push(`Cible ${target.nodeId}, ${field}: changes.${field}.values doit correspondre à expectedAfter.${field}.`);
+          const expectedField = field === 'publics' ? 'metiersPublics' : field;
+          if (field === 'publics') warnings.push(`Cible ${target.nodeId}: changes.publics legacy converti en changes.metiersPublics.`);
+          if (expectedField === 'metiersPublics' && request?.operation === 'add') {
+            if (!Array.isArray(target.expectedAfterContains?.metiersPublics)) warnings.push(`Cible ${target.nodeId}, metiersPublics: expectedAfterContains.metiersPublics absent (diagnostic facultatif).`);
+          } else if (!Array.isArray(target.expectedAfter?.[expectedField])) errors.push(`Cible ${target.nodeId}, ${expectedField}: expectedAfter doit être un tableau.`);
+          else if (request?.values && !compareTaxonomySets(request.values, target.expectedAfter[expectedField])) errors.push(`Cible ${target.nodeId}, ${expectedField}: changes.${expectedField}.values doit correspondre à expectedAfter.${expectedField}.`);
         }
         const key = `${target.nodeId}|${field}`;
         const signature = JSON.stringify(request);
@@ -1810,11 +1814,15 @@
         departmentCodes: Array.isArray(target.departmentCodes) ? target.departmentCodes : [], expectedBefore: target.expectedBefore || {}, changes: target.changes || {}
       })));
     }
-    if (payload?.type === 'bulk_drupal_theme_public_update') return (payload.targets || []).map((target) => ({
-      batchId: payload.batchId, payloadType: payload.type, nodeId: String(target.nodeId || '').trim(), pageUrl: target.pageUrl || '',
-      title: target.title || '', requestedTitle: target.title || '', inventorySheet: target.inventorySheet || '', sourceOvp: target.sourceOvp || '',
-      expectedBefore: target.expectedBefore || {}, changes: target.changes || {}, expectedAfter: target.expectedAfter || {}
-    }));
+    if (payload?.type === 'bulk_drupal_theme_public_update') return (payload.targets || []).map((target) => {
+      const changes = { ...(target.changes || {}) };
+      if (changes.publics && !changes.metiersPublics) { changes.metiersPublics = changes.publics; delete changes.publics; }
+      return {
+        batchId: payload.batchId, payloadType: payload.type, nodeId: String(target.nodeId || '').trim(), pageUrl: target.pageUrl || '',
+        title: target.title || '', requestedTitle: target.title || '', inventorySheet: target.inventorySheet || '', sourceOvp: target.sourceOvp || '',
+        expectedBefore: target.expectedBefore || {}, changes, expectedAfter: target.expectedAfter || {}, expectedAfterContains: target.expectedAfterContains || {}
+      };
+    });
     return [];
   }
 
@@ -2145,7 +2153,32 @@
       try {
         const current = readTaxonomyField(field);
         if (field === 'theme') log('info', target, `Thématiques actuelles : ${JSON.stringify(current)}. Thématiques attendues : ${JSON.stringify(desired)}.`);
-        if (field === 'metiersPublics') log('info', target, `Publics actuels : ${JSON.stringify(current)}. Publics attendus : ${JSON.stringify(desired)}.`);
+        if (field === 'metiersPublics') log('info', target, `Métiers/publics Drupal actuels : ${JSON.stringify(current)}. Métiers demandés : ${JSON.stringify(desired)}.`);
+        if (field === 'metiersPublics' && target.payloadType === 'bulk_drupal_theme_public_update') {
+          const container = findPublicTreeContainer();
+          if (!container) throw typedError('field_not_found', 'Champ métiers/publics introuvable : #edit-field-metier-tags-wrapper absent');
+          let after = current, report;
+          if (request.operation === 'add') {
+            report = await addMetiersPublics(container, desired, target);
+            after = report.after;
+            result.metiersPublicsReport = report;
+            if (!taxonomyContainsAll(after, desired)) throw typedError('field_not_found', `Échec de vérification après ajout : ${desired.join(', ')}`);
+          } else if (request.operation === 'replace') {
+            after = await replaceMetiersPublics(container, desired);
+            if (!compareTaxonomySets(after, desired)) throw typedError('field_not_found', 'Valeur finale incorrecte pour metiersPublics.');
+          } else if (request.operation === 'remove') {
+            const kept = current.filter((entry) => !desired.some((term) => normalizeText(term) === normalizeText(entry)));
+            after = await replaceMetiersPublics(container, kept);
+            if (!compareTaxonomySets(after, kept)) throw typedError('field_not_found', 'Valeur finale incorrecte après suppression metiersPublics.');
+          } else if (request.operation === 'clear') {
+            if (target.confirmClearMetiersPublics !== true && state.intranetUpdate.payload?.settings?.confirmClearMetiersPublics !== true) throw typedError('invalid_operation', 'Suppression totale des métiers refusée sans confirmation explicite.');
+            after = await replaceMetiersPublics(container, []);
+          }
+          if (compareTaxonomySets(current, after)) unchangedField(result, originalField, current);
+          else updatedField(result, originalField, current, after);
+          log('success', target, `Métiers/publics Drupal vérifiés : ${JSON.stringify(after)}.`);
+          continue;
+        }
         if (compareTaxonomySets(current, desired)) {
           unchangedField(result, originalField, current);
           log('success', target, `${field === 'theme' ? 'Thématiques' : 'Publics'} vérifiées avec succès.`);
@@ -2169,9 +2202,11 @@
     return result;
   }
 
-  function normalizeTerms(value) { return (Array.isArray(value) ? value : String(value ?? '').split(/[;,|\n]/)).map((term) => typeof term === 'object' ? String(term.label || term.name || '') : String(term)).map((term) => term.trim()).filter(Boolean); }
+  function normalizeTerms(value) { return (Array.isArray(value) ? value : String(value ?? '').split(/[;,|\n]/)).map((term) => typeof term === 'object' ? String(term.path || term.label || term.name || '') : String(term)).map((term) => term.trim()).filter(Boolean); }
   function normalizedTaxonomySet(terms) { return [...new Set(normalizeTerms(terms).map(normalizeText))].sort(); }
   function compareTaxonomySets(a, b) { return JSON.stringify(normalizedTaxonomySet(a)) === JSON.stringify(normalizedTaxonomySet(b)); }
+  function taxonomyTermKeys(value) { const text = typeof value === 'object' ? String(value.path || value.label || value.name || '') : String(value ?? ''); const parts = text.split('>').map((part) => part.trim()).filter(Boolean); return [normalizeText(text), normalizeText(parts.at(-1) || text)].filter(Boolean); }
+  function taxonomyContainsAll(actual, expectedAdditions) { const actualSet = new Set(normalizeTerms(actual).flatMap(taxonomyTermKeys)); return normalizeTerms(expectedAdditions).every((value) => taxonomyTermKeys(value).some((key) => actualSet.has(key))); }
 
 
   /***************************************************************************
@@ -2374,6 +2409,33 @@
     const checkbox = node.querySelector('input[type="checkbox"],.fancytree-checkbox');
     const selected = node.classList.contains('fancytree-selected') || checkbox?.checked || checkbox?.getAttribute('aria-checked') === 'true';
     if (Boolean(selected) !== Boolean(checked)) { await clickElement(checkbox || node.querySelector('.fancytree-title'), `${checked ? 'Sélectionner' : 'Désélectionner'} le terme exact`); await waitForAjax(); }
+  }
+
+
+  async function addMetiersPublics(container, values, target = null) {
+    const requestedAdditions = uniquePublicEntries(normalizeTerms(values));
+    const report = { requestedAdditions, before: getSelectedFancyTreeTerms(container), added: [], alreadyPresent: [], notFound: [], after: [] };
+    for (const publicEntry of requestedAdditions) {
+      const path = publicPath(publicEntry);
+      const label = path.join(' > ');
+      if (taxonomyContainsAll(getSelectedFancyTreeTerms(container), [publicEntry])) { report.alreadyPresent.push(label); log('info', target, `Métier déjà présent, aucune action : ${label}`); continue; }
+      try {
+        await clickFancytreePath('#edit-field-metier-tags-wrapper', path, `Ajouter le métier : ${label}`, { optional: false });
+        const afterClick = getSelectedFancyTreeTerms(container);
+        if (taxonomyContainsAll(afterClick, [publicEntry])) { report.added.push(label); log('success', target, `Métier ajouté avec succès : ${label}`); }
+        else { report.notFound.push(label); log('error', target, `Échec de vérification après ajout : ${label}`); }
+      } catch (error) {
+        report.notFound.push(label);
+        log('error', target, `Métier introuvable : ${label}`);
+      }
+    }
+    report.after = getSelectedFancyTreeTerms(container);
+    if (report.notFound.length) throw typedError('field_not_found', `Métier introuvable dans l’arbre Drupal : ${report.notFound.join(', ')}`);
+    return report;
+  }
+
+  async function replaceMetiersPublics(container, values) {
+    return applyFancyTreeExpectedState(container, normalizeTerms(values));
   }
 
   async function applyFancyTreeExpectedState(container, expectedTerms) {
