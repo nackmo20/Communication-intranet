@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EAFC Drupal - Mise à jour parcours depuis Mapping JSON + Excel
 // @namespace    https://eafc.local/tampermonkey
-// @version      1.8.07
+// @version      1.8.09
 // @description  Met à jour des pages de parcours Drupal depuis un mapping JSON externe et un export Excel EAFC Formation Export plan et sessions.
 // @author       EAFC
 // @match        *://*/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '1.8.07';
+  const SCRIPT_VERSION = '1.8.09';
 
   /***************************************************************************
    * CONFIGURATION GLOBALE
@@ -36,7 +36,26 @@
     // Correspondance demandée : le mapping JSON donne l'identifiant dispositif,
     // l'Excel est retrouvé via la colonne exacte/souple "Dispositif : code".
     // Le module reste conservé pour les logs et diagnostics, mais n'est plus bloquant.
-    MATCH_EXCEL_BY_DISPOSITIF_ONLY: true
+    MATCH_EXCEL_BY_DISPOSITIF_ONLY: true,
+    THEMATIC_AUTOCOMPLETE_DELAY_MS: 800,
+    THEMATIC_AUTOCOMPLETE_SELECTION_DELAY_MS: 600,
+    // Thématiques obligatoires ajoutées à chaque fiche Drupal.
+    REQUIRED_THEMATICS: ['EAFC poitiers', '6331'],
+    // Mapping conservé du module isolé : alias source -> identifiants Drupal existants.
+    THEMATIC_ALIAS_MAP: [
+      [['Pédagogique', 'Pratique pédagogique transversales', 'Pratiques pédagogiques transversales'], ['6624']],
+      [['Numérique', 'Compétences, culture et usages du numérique'], ['6362']],
+      [['QVCT, SST', 'QVCT', 'SST', 'Qualité de vie au travail – Santé et sécurité au travail'], ['6385', '6404']],
+      [['Valeurs de la république, citoyenneté', 'Valeurs de la République et citoyenneté', 'Valeurs de la république', 'citoyenneté'], ['6627', '6236']],
+      [['Orientation', 'Orientation et parcours scolaire'], ['6364']],
+      [['Ecole inclusive', 'École inclusive', 'Ecole inclusive, accessible et ouverte à tous'], ['6314']],
+      [['Europe et international', 'Ouverture européenne et internationale'], ['6328']],
+      [['Formateurs', 'Formation de formateurs et tuteurs'], ['6625']],
+      [['Santé des élèves', 'Santé mentale et bien-être des élèves'], ['6403']],
+      [['Encadrement'], ['6455']],
+      [['Carrière', 'Carrière et évolution professionnelle'], ['6227']],
+      [['2nd degré', 'Second degré'], ['6202']]
+    ]
   };
 
   const SELECTORS = {
@@ -173,10 +192,16 @@
     ],
     thematics: [
       'input[name^="field_formation_thematic["][name$="[target_id]"]',
+      'input[data-drupal-selector^="edit-field-formation-thematic-"][data-autocomplete-path]',
       'input[data-drupal-selector^="edit-field-formation-thematic-"][data-drupal-selector$="-target-id"]',
       'input[name*="field_thematique"]',
       'input[name*="field_theme"]'
     ],
+    thematicAddMore: [
+      '[data-drupal-selector="edit-field-formation-thematic-add-more"]',
+      'input[name="field_formation_thematic_add_more"]'
+    ],
+    publicTreeWrapper: ['#edit-field-metier-tags-wrapper'],
     save: [
       'input[data-drupal-selector="edit-submit"]',
       'input#edit-submit',
@@ -275,6 +300,8 @@
           <button id="eafc-export" class="eafc-btn secondary" type="button">Exporter les logs</button>
           <button id="eafc-export-report" class="eafc-btn secondary" type="button">Exporter bilan Excel</button>
           <button id="eafc-export-intranet-report" class="eafc-btn secondary" type="button">Exporter rapport JSON</button>
+          <button id="eafc-reset-intranet" class="eafc-btn secondary" type="button">Reset JSON maj public/contenu</button>
+          <button id="eafc-reset-excel" class="eafc-btn secondary" type="button">Retirer Excel</button>
           <button id="eafc-reset-imports" class="eafc-btn danger" type="button">Reset JSON/Excel</button>
         </div>
         <div id="eafc-errors" class="eafc-errors" hidden></div>
@@ -302,6 +329,8 @@
     qs('#eafc-export').addEventListener('click', exportLogs);
     qs('#eafc-export-report').addEventListener('click', exportUpdateReportExcel);
     qs('#eafc-export-intranet-report').addEventListener('click', exportIntranetReportJson);
+    qs('#eafc-reset-intranet').addEventListener('click', resetIntranetUpdateData);
+    qs('#eafc-reset-excel').addEventListener('click', resetExcelData);
     qs('#eafc-reset-imports').addEventListener('click', resetImportedData);
     qs('.eafc-toggle').addEventListener('click', () => {
       state.panelCollapsed = !state.panelCollapsed;
@@ -409,6 +438,84 @@
   }
 
 
+  function resetIntranetUpdateData() {
+    if (!state.intranetUpdate.payload && !readStoredJson(STORAGE_KEYS.intranetPayload, null)) {
+      setAlert('Aucun JSON de mise à jour public/contenu n’est actuellement chargé.');
+      setStatus('Aucun JSON de mise à jour à réinitialiser.');
+      return;
+    }
+    if (!window.confirm('Réinitialiser uniquement le JSON de mise à jour public/contenu ? Le mapping JSON Sofia et l’Excel seront conservés.')) return;
+
+    state.intranetUpdate = {
+      payload: null,
+      payloadType: '',
+      payloadFileName: '',
+      normalizedTargets: [],
+      validationErrors: [],
+      validationWarnings: [],
+      preview: [],
+      reportItems: [],
+      startedAt: '',
+      finishedAt: '',
+      backupItems: [],
+      backupGenerated: false
+    };
+    state.activeWorkflow = 'sofia';
+    state.stopRequested = true;
+
+    const intranetInput = qs('#eafc-intranet-file');
+    if (intranetInput) intranetInput.value = '';
+
+    deleteStoredValue(STORAGE_KEYS.intranetPayload);
+    deleteStoredValue(STORAGE_KEYS.intranetPayloadFileName);
+    deleteStoredValue(STORAGE_KEYS.intranetBatchState);
+    deleteStoredValue(STORAGE_KEYS.intranetReport);
+    clearBatchState();
+    renderWorkflowMode();
+    renderIntranetPreview();
+    renderSummary();
+    renderErrors();
+    setAlert('JSON de mise à jour public/contenu réinitialisé. Le mapping JSON Sofia et l’Excel sont conservés.');
+    setStatus('JSON de mise à jour réinitialisé.');
+    log('warning', null, 'JSON de mise à jour public/contenu réinitialisé ; mapping JSON Sofia et Excel conservés.');
+  }
+
+
+  function resetExcelData() {
+    if (!state.excelRows.length && !readStoredJson(STORAGE_KEYS.excelRows, []).length) {
+      setAlert('Aucun fichier Excel de mise à jour n’est actuellement chargé.');
+      setStatus('Aucun Excel à retirer.');
+      return;
+    }
+    if (!window.confirm('Retirer uniquement le fichier Excel de mise à jour ? Le mapping JSON et les imports intranet seront conservés.')) return;
+
+    state.excelRows = [];
+    state.excelIndex = new Map();
+    state.enrichedItems = [];
+    state.validationErrors = [];
+    state.lastSummary = {
+      ...state.lastSummary,
+      excel: 0,
+      matches: 0,
+      errors: 0
+    };
+    state.stopRequested = true;
+
+    const excelInput = qs('#eafc-excel-file');
+    if (excelInput) excelInput.value = '';
+
+    writeStoredJson(STORAGE_KEYS.mappingItems, state.mappingItems);
+    deleteStoredValue(STORAGE_KEYS.excelRows);
+    writeStoredValue(STORAGE_KEYS.savedAt, new Date().toLocaleString('fr-FR'));
+    clearBatchState();
+    renderSummary();
+    renderErrors();
+    setAlert('Fichier Excel retiré. Le mapping JSON est conservé ; importez un nouvel Excel pour relancer l’analyse Sofia.');
+    setStatus('Excel retiré.');
+    log('warning', null, 'Fichier Excel de mise à jour retiré ; mapping JSON conservé.');
+  }
+
+
   function resetImportedData() {
     if (!window.confirm('Réinitialiser le mapping JSON, l’Excel et le batch en cours ?')) return;
     state.mappingItems = [];
@@ -484,7 +591,7 @@
       state.activeWorkflow = 'sofia';
       const text = await file.text();
       const parsed = parseMappingJson(text);
-      state.mappingItems = normalizeMappingItems(parsed.items || parsed);
+      state.mappingItems = normalizeMappingItems(parsed.items || parsed, parsed);
       log('success', null, `${state.mappingItems.length} ligne(s) de mapping importée(s).`);
       state.lastSummary.mapping = state.mappingItems.length;
       persistImportedData('mapping');
@@ -501,7 +608,7 @@
     return data;
   }
 
-  function normalizeMappingItems(items) {
+  function normalizeMappingItems(items, globalData = {}) {
     return (items || []).map((item) => {
       const planSession = item.planSession || item.planSessions?.[0] || {};
       const updateKey = item.tampermonkeyUpdateKeys?.[0] || planSession.tampermonkeyUpdateKey || {};
@@ -518,9 +625,59 @@
         rne: normalizeRne(item.rne || item.uai || planSession.rne || updateKey.rne || extractRneFromText(planSession.lieu || '')),
         planSessionGroupId: cleanCode(planSession.groupId || item.groupId || ''),
         planSessionLabel: cleanCode(planSession.sessionLabel || item.sessionLabel || ''),
+        theme: extractThematicSourceValue(item, globalData),
+        publics: extractPublicSourceValue(item, globalData),
         mappingMode: String(item.mappingMode || 'single')
       };
     });
+  }
+
+  function extractThematicSourceValue(item = {}, globalData = {}) {
+    return firstDefinedValue(
+      item.theme,
+      item.thematiques,
+      item.thematic,
+      item.themes,
+      item.taxonomy?.theme,
+      item.taxonomy?.thematiques,
+      item.changes?.theme?.value,
+      item.expectedAfter?.theme,
+      globalData.theme,
+      globalData.thematiques,
+      globalData.thematic,
+      globalData.themes,
+      globalData.taxonomy?.theme,
+      globalData.taxonomy?.thematiques,
+      globalData.changes?.theme?.value,
+      globalData.expectedAfter?.theme
+    );
+  }
+
+  function extractPublicSourceValue(item = {}, globalData = {}) {
+    return firstDefinedValue(
+      item.publics,
+      item.metiersPublics,
+      item.publicsMetiers,
+      item.taxonomy?.publics,
+      item.taxonomy?.metiersPublics,
+      item.changes?.publics?.value,
+      item.changes?.metiersPublics?.value,
+      item.expectedAfter?.publics,
+      item.expectedAfter?.metiersPublics,
+      globalData.publics,
+      globalData.metiersPublics,
+      globalData.publicsMetiers,
+      globalData.taxonomy?.publics,
+      globalData.taxonomy?.metiersPublics,
+      globalData.changes?.publics?.value,
+      globalData.changes?.metiersPublics?.value,
+      globalData.expectedAfter?.publics,
+      globalData.expectedAfter?.metiersPublics
+    );
+  }
+
+  function firstDefinedValue(...values) {
+    return values.find((value) => value !== undefined && value !== null && !(Array.isArray(value) && !value.length) && String(value).trim() !== '');
   }
 
   /***************************************************************************
@@ -821,8 +978,24 @@
   function scheduleAutoResumeBatch() {
     const batch = readBatchState();
     if (!batch.active) return;
+
+    const workflowType = batch.workflowType || 'sofia';
+    if (workflowType !== 'sofia') {
+      const payload = state.intranetUpdate.payload;
+      if (!payload) {
+        log('warning', null, `Batch ${workflowType} abandonné : aucun payload intranet correspondant n’est chargé.`);
+        clearBatchState();
+        return;
+      }
+      if (workflowType !== state.activeWorkflow) {
+        log('warning', null, `Batch ${workflowType} abandonné : le workflow actif est ${state.activeWorkflow}.`);
+        clearBatchState();
+        return;
+      }
+    }
+
     setStatus('Batch détecté : reprise automatique…');
-    setAlert('Batch en cours restauré : reprise automatique, pas besoin de recliquer sur Démarrer.');
+    setAlert('Batch compatible restauré : reprise automatique.');
     window.setTimeout(() => runPersistedBatchStep(), 900);
   }
 
@@ -888,8 +1061,16 @@
             }
             const readyToEdit = await ensureEditPage();
             if (!readyToEdit) return;
-            const intranetResult = workflowType === 'sofia' ? null : await updateCurrentDrupalPageFromIntranetPayload(item);
-            if (workflowType === 'sofia') await updateCurrentDrupalPage(item, item.excelData);
+            let intranetResult = null;
+            if (workflowType === 'sofia') {
+              if (state.activeWorkflow !== 'sofia') throw typedError('workflow_mismatch', `Refus du workflow Sofia : le workflow actif est ${state.activeWorkflow}.`);
+              await updateCurrentDrupalPage(item, item.excelData);
+            } else {
+              if (!state.intranetUpdate.payload) throw typedError('workflow_mismatch', 'Aucun JSON intranet chargé pour ce batch.');
+              if (workflowType !== state.activeWorkflow) throw typedError('workflow_mismatch', `Workflow du batch incompatible : ${workflowType} au lieu de ${state.activeWorkflow}.`);
+              if (item.payloadType !== state.intranetUpdate.payload.type) throw typedError('workflow_mismatch', `Type de cible incompatible : ${item.payloadType} au lieu de ${state.intranetUpdate.payload.type}.`);
+              intranetResult = await updateCurrentDrupalPageFromIntranetPayload(item);
+            }
             const nextIndex = Number(batch.index || 0) + 1;
             const hasMoreItems = nextIndex < validItems.length;
 
@@ -1020,9 +1201,18 @@
   }
 
   async function openFirstResult(item) {
-    const link = await waitForFunction(getFirstResultTitleLink, CONFIG.MAX_WAIT_TIME, 'Lien du premier résultat dans la colonne titre introuvable.');
+    const link = await waitForFunction(getFirstResultTitleLink, CONFIG.MAX_WAIT_TIME, 'Lien du premier résultat dans la colonne titre introuvable.').catch(() => null);
+    if (!link && item?.pageUrl) {
+      log('warning', item, `Résultat admin introuvable : navigation de secours vers ${item.pageUrl}.`);
+      location.href = item.pageUrl;
+      await sleep(1000);
+      return;
+    }
+    if (!link) throw new Error('Lien du premier résultat dans la colonne titre introuvable.');
+
     const row = link.closest('tr');
-    if (row && !row.textContent.includes(item.drupalParcoursId)) log('warning', item, 'Le premier résultat ne contient pas clairement l’ID filtré dans la ligne.');
+    const expectedId = item.drupalParcoursId || item.nodeId || '';
+    if (row && expectedId && !row.textContent.includes(expectedId)) log('warning', item, 'Le premier résultat ne contient pas clairement l’ID filtré dans la ligne.');
     log('info', item, `Ouverture du résultat : ${normalizeText(link.textContent).slice(0, 120)}`);
     await clickElement(link, 'Ouvrir le premier résultat Drupal');
     await sleep(1000);
@@ -1067,6 +1257,8 @@
     setInputValue(await waitForAnySelector(SELECTORS.endDate, CONFIG.MAX_WAIT_TIME), endDate);
     setInputValue(await waitForAnySelector(SELECTORS.unpublishDate, CONFIG.MAX_WAIT_TIME), unpublishDate);
     log('success', item, `Dates mises à jour : début=${startDate}, fin=${endDate}, dépublication=${unpublishDate}.`);
+
+    await applyPublicsAndThematicsFromSource(item, data);
 
     await clickFormationBodyEditBeforeRichText(item);
 
@@ -1505,14 +1697,13 @@
   /***************************************************************************
    * MISES À JOUR INTRANET (CONTENU ET TAXONOMIES)
    ***************************************************************************/
-  const INTRANET_PAYLOAD_TYPES = ['update_drupal_pages', 'bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'];
-  const INTRANET_FIELDS = ['title', 'objectif', 'contenu', 'accessibilite', 'miseEnPlace', 'effectif', 'dureeTotale', 'presentielH', 'distancielH', 'publics', 'prerequis', 'contact', 'theme', 'metiersPublics', 'lieux', 'departements', 'publicationDate', 'preinscriptionStartDate', 'unpublishDate', 'preinscriptionLinks'];
+  const INTRANET_PAYLOAD_TYPES = ['update_drupal_pages', 'bulk_drupal_theme_public_update'];
+  const INTRANET_FIELDS = ['title', 'objectif', 'contenu', 'accessibilite', 'miseEnPlace', 'effectif', 'dureeTotale', 'presentielH', 'distancielH', 'publics', 'prerequis', 'contact', 'theme', 'metiersPublics', 'departements', 'unpublishDate', 'preinscriptionLinks'];
   const EDITORIAL_FIELDS = ['objectif', 'contenu', 'accessibilite', 'miseEnPlace', 'effectif', 'dureeTotale', 'presentielH', 'distancielH', 'publics', 'prerequis', 'contact'];
-  const TAXONOMY_FIELDS = ['theme', 'metiersPublics', 'departements', 'lieux'];
+  const TAXONOMY_FIELDS = ['theme', 'metiersPublics', 'departements'];
   const CONTENT_OPERATIONS = ['add', 'replace', 'delete'];
-  const BULK_OPERATIONS = ['add', 'remove', 'replace_all', 'replace_term', 'clean'];
   const THEME_PUBLIC_OPERATIONS = ['add', 'remove', 'replace', 'clear'];
-  const REPORT_STATUSES = ['success', 'partial_success', 'already_up_to_date', 'conflict', 'page_not_found', 'field_not_found', 'save_failed', 'access_denied', 'skipped', 'cancelled'];
+  const REPORT_STATUSES = ['success', 'partial_success', 'already_up_to_date', 'conflict', 'page_not_found', 'field_not_found', 'save_failed', 'access_denied', 'workflow_mismatch', 'unauthorized_field_access', 'unauthorized_field_change', 'skipped', 'cancelled'];
 
   async function handleIntranetUpdateFile(file) {
     try {
@@ -1534,6 +1725,11 @@
         setAlert(`Payload intranet invalide : ${validation.errors.length} erreur(s). Aucune modification ne sera possible.`);
         validation.errors.forEach((message) => log('error', null, message));
       } else {
+        const previousBatch = readBatchState();
+        if (previousBatch.active) log('warning', null, `Batch précédent annulé lors de l’import du nouveau JSON : ${previousBatch.workflowType || 'sofia'}.`);
+        clearBatchState();
+        state.stopRequested = false;
+        state.running = false;
         state.activeWorkflow = payload.type === 'update_drupal_pages' ? 'intranet_content' : 'intranet_taxonomy';
         writeStoredJson(STORAGE_KEYS.intranetPayload, payload);
         writeStoredValue(STORAGE_KEYS.intranetPayloadFileName, file.name);
@@ -1559,27 +1755,41 @@
     if (!payload.type) errors.push('Propriété type absente.');
     else if (!INTRANET_PAYLOAD_TYPES.includes(payload.type)) errors.push(`Type inconnu : ${payload.type}.`);
     if (!String(payload.batchId || '').trim()) errors.push('Batch ID absent.');
-    if (payload.type === 'update_drupal_pages' && !Array.isArray(payload.items)) errors.push('Tableau items absent.');
-    if (['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(payload.type) && !Array.isArray(payload.targets)) errors.push('Tableau targets absent.');
+    if (payload.type === 'update_drupal_pages') {
+      if (payload.version !== '3.0') errors.push('Version update_drupal_pages non prise en charge.');
+      if (!Array.isArray(payload.items)) errors.push('items[] est obligatoire.');
+    }
+    if (payload.type === 'bulk_drupal_theme_public_update') {
+      if (payload.version !== '1.0') errors.push('Version bulk_drupal_theme_public_update non prise en charge.');
+      if (!Array.isArray(payload.targets)) errors.push('targets[] est obligatoire.');
+    }
     const targets = normalizeIntranetTargets(payload);
     if (!targets.length) errors.push('Aucune cible exploitable dans le payload.');
     const seen = new Map();
     targets.forEach((target, index) => {
       if (!String(target.nodeId || '').trim()) errors.push(`Cible ${index + 1} : Node ID absent.`);
-      const requested = payload.type === 'update_drupal_pages' || payload.type === 'bulk_drupal_theme_public_update' ? target.changes : target.expectedAfter;
+      const requested = target.changes;
       if (!requested || typeof requested !== 'object' || Array.isArray(requested) || !Object.keys(requested).length) errors.push(`Cible ${target.nodeId || index + 1} vide : changes/expectedAfter absent.`);
       Object.entries(requested || {}).forEach(([field, request]) => {
         if (!INTRANET_FIELDS.includes(field)) errors.push(`Cible ${target.nodeId}: champ inconnu ${field}.`);
         if (payload.type === 'update_drupal_pages') {
           if (!request || typeof request !== 'object') errors.push(`Cible ${target.nodeId}, ${field}: demande invalide.`);
-          else if (!CONTENT_OPERATIONS.includes(request.operation)) errors.push(`Cible ${target.nodeId}, ${field}: opération inconnue ${request.operation}.`);
+          else {
+            if (!CONTENT_OPERATIONS.includes(request.operation)) errors.push(`Cible ${target.nodeId}, ${field}: opération inconnue ${request.operation}.`);
+            if (!Object.prototype.hasOwnProperty.call(request, 'value')) errors.push(`Cible ${target.nodeId}, ${field}: value est obligatoire pour update_drupal_pages.`);
+            if (Object.prototype.hasOwnProperty.call(request, 'values')) errors.push(`Cible ${target.nodeId}, ${field}: values est interdit pour update_drupal_pages.`);
+          }
           if (field === 'title' && request?.operation === 'delete') errors.push(`Cible ${target.nodeId}, title: invalid_operation (le titre ne peut pas être vidé).`);
         }
         if (payload.type === 'bulk_drupal_theme_public_update') {
           if (!['theme', 'publics'].includes(field)) errors.push(`Cible ${target.nodeId}: le format thématiques/publics ne reconnaît que theme et publics.`);
           if (!request || typeof request !== 'object' || !Array.isArray(request.values)) errors.push(`Cible ${target.nodeId}, ${field}: values doit être un tableau.`);
-          else if (!THEME_PUBLIC_OPERATIONS.includes(request.operation)) errors.push(`Cible ${target.nodeId}, ${field}: opération inconnue ${request.operation}.`);
-          if (!Object.prototype.hasOwnProperty.call(target.expectedAfter || {}, field)) errors.push(`Cible ${target.nodeId}, ${field}: expectedAfter absent.`);
+          else {
+            if (!THEME_PUBLIC_OPERATIONS.includes(request.operation)) errors.push(`Cible ${target.nodeId}, ${field}: opération inconnue ${request.operation}.`);
+            if (Object.prototype.hasOwnProperty.call(request, 'value')) errors.push(`Cible ${target.nodeId}, ${field}: value est interdit pour bulk_drupal_theme_public_update.`);
+          }
+          if (!Array.isArray(target.expectedAfter?.[field])) errors.push(`Cible ${target.nodeId}, ${field}: expectedAfter doit être un tableau.`);
+          else if (request?.values && !compareTaxonomySets(request.values, target.expectedAfter[field])) errors.push(`Cible ${target.nodeId}, ${field}: changes.${field}.values doit correspondre à expectedAfter.${field}.`);
         }
         const key = `${target.nodeId}|${field}`;
         const signature = JSON.stringify(request);
@@ -1587,13 +1797,6 @@
         seen.set(key, signature);
       });
     });
-    if (payload.type === 'bulk_drupal_taxonomy_update') {
-      (payload.operations || []).forEach((operation, index) => {
-        if (!['publics', 'thematiques', 'theme', 'metiersPublics', 'departements', 'lieux'].includes(operation.field)) errors.push(`Opération massive ${index + 1}: champ inconnu ${operation.field}.`);
-        if (!BULK_OPERATIONS.includes(operation.operation)) errors.push(`Opération massive ${index + 1}: opération inconnue ${operation.operation}.`);
-      });
-      if (payload.selection?.selectedCount != null && Number(payload.selection.selectedCount) !== targets.length) warnings.push(`selection.selectedCount (${payload.selection.selectedCount}) diffère du nombre de cibles (${targets.length}).`);
-    }
     if (payload.type === 'bulk_drupal_theme_public_update' && payload.selection?.selectedCount != null && Number(payload.selection.selectedCount) !== targets.length) warnings.push(`selection.selectedCount (${payload.selection.selectedCount}) diffère du nombre de cibles (${targets.length}).`);
     return { errors: [...new Set(errors)], warnings: [...new Set(warnings)], targets };
   }
@@ -1607,10 +1810,10 @@
         departmentCodes: Array.isArray(target.departmentCodes) ? target.departmentCodes : [], expectedBefore: target.expectedBefore || {}, changes: target.changes || {}
       })));
     }
-    if (['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(payload?.type)) return (payload.targets || []).map((target) => ({
+    if (payload?.type === 'bulk_drupal_theme_public_update') return (payload.targets || []).map((target) => ({
       batchId: payload.batchId, payloadType: payload.type, nodeId: String(target.nodeId || '').trim(), pageUrl: target.pageUrl || '',
       title: target.title || '', requestedTitle: target.title || '', inventorySheet: target.inventorySheet || '', sourceOvp: target.sourceOvp || '',
-      expectedBefore: target.expectedBefore || {}, changes: target.changes || {}, expectedAfter: target.expectedAfter || {}, operations: payload.operations || []
+      expectedBefore: target.expectedBefore || {}, changes: target.changes || {}, expectedAfter: target.expectedAfter || {}
     }));
     return [];
   }
@@ -1619,14 +1822,10 @@
     return targets.map((target) => {
       const desired = payload.type === 'update_drupal_pages'
         ? Object.fromEntries(Object.entries(target.changes).map(([field, change]) => [field, change.value]))
-        : payload.type === 'bulk_drupal_theme_public_update'
-          ? Object.fromEntries(Object.keys(target.changes).map((field) => [field, target.expectedAfter[field]]))
-          : target.expectedAfter;
+        : Object.fromEntries(Object.entries(target.changes).map(([field, change]) => [field, change.values]));
       const destructive = payload.type === 'update_drupal_pages'
         ? Object.values(target.changes).filter((change) => change.operation === 'delete').length
-        : payload.type === 'bulk_drupal_theme_public_update'
-          ? Object.values(target.changes).filter((change) => ['remove', 'replace', 'clear'].includes(change.operation)).length
-          : (payload.operations || []).filter((operation) => ['remove', 'replace_all', 'replace_term'].includes(operation.operation)).length;
+        : Object.values(target.changes).filter((change) => ['remove', 'replace', 'clear'].includes(change.operation)).length;
       return { nodeId: target.nodeId, title: target.requestedTitle || target.title || '', fields: Object.keys(desired), before: target.expectedBefore || {}, after: desired, destructive };
     });
   }
@@ -1678,11 +1877,24 @@
       setAlert('Impossible de démarrer : importez un payload intranet valide contenant au moins une cible.'); return;
     }
     const existing = readBatchState();
-    if (existing.active) return runPersistedBatchStep();
-    const replaceAll = intranet.payload.type === 'bulk_drupal_taxonomy_update' && (intranet.payload.operations || []).some((operation) => operation.operation === 'replace_all');
-    if (replaceAll && !CONFIG.DRY_RUN && !window.confirm('Confirmation supplémentaire : replace_all remplacera réellement tous les termes ciblés. Continuer ?')) return;
+    if (existing.active) {
+      const existingWorkflow = existing.workflowType || 'sofia';
+      const requestedWorkflow = state.activeWorkflow;
+      if (existingWorkflow !== requestedWorkflow) {
+        log('warning', null, `Ancien batch ${existingWorkflow} annulé : le workflow demandé est ${requestedWorkflow}.`);
+        clearBatchState();
+      } else {
+        return runPersistedBatchStep();
+      }
+    }
     const safe = intranet.payload.settings?.safeMode === true;
-    const summary = `${intranet.normalizedTargets.length} cible(s), workflow ${state.activeWorkflow}, simulation=${CONFIG.DRY_RUN ? 'oui' : 'non'}, auto-save=${CONFIG.AUTO_SAVE ? 'oui' : 'non'}${safe ? ', safeMode=oui (aucun enregistrement automatique)' : ''}. Continuer ?`;
+    const persistentAllowed = !CONFIG.DRY_RUN && CONFIG.AUTO_SAVE && !safe;
+    const blockingReasons = [
+      CONFIG.DRY_RUN ? 'mode simulation actif' : '',
+      !CONFIG.AUTO_SAVE ? 'enregistrement automatique désactivé' : '',
+      safe ? 'mode sécurisé du JSON actif' : ''
+    ].filter(Boolean).join(', ') || 'aucun blocage';
+    const summary = `${intranet.normalizedTargets.length} cible(s), workflow ${state.activeWorkflow}.\nSimulation : ${CONFIG.DRY_RUN ? 'oui' : 'non'}\nEnregistrement automatique : ${CONFIG.AUTO_SAVE ? 'oui' : 'non'}\nMode sécurisé du JSON : ${safe ? 'oui' : 'non'}\nModification persistante possible : ${persistentAllowed ? 'oui' : 'non'}\nBlocage éventuel : ${blockingReasons}\nContinuer ?`;
     if (!window.confirm(summary)) return;
     intranet.reportItems = []; intranet.startedAt = new Date().toISOString(); intranet.finishedAt = ''; intranet.backupItems = []; intranet.backupGenerated = false;
     persistIntranetReport();
@@ -1692,7 +1904,7 @@
   }
 
   function resolveDrupalTargetField(payloadType, fieldName) {
-    if (fieldName === 'publics') return ['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(payloadType) ? 'metiersPublics' : 'editorialPublics';
+    if (fieldName === 'publics') return payloadType === 'bulk_drupal_theme_public_update' ? 'metiersPublics' : 'editorialPublics';
     if (fieldName === 'thematiques') return 'theme';
     return fieldName;
   }
@@ -1700,6 +1912,7 @@
   async function updateCurrentDrupalPageFromIntranetPayload(target) {
     const report = createIntranetReportItem(target);
     try {
+      logIntranetTargetMode(target);
       if (isAccessDeniedPage()) throw typedError('access_denied', 'Accès Drupal refusé ou redirection vers la connexion.');
       const before = await readCurrentDrupalValues(target);
       report.before = before.values; report.title = before.title || target.requestedTitle || target.title || '';
@@ -1709,15 +1922,15 @@
         return report;
       }
       await ensureIntranetBackup(target, before);
-      if (target.payloadType === 'update_drupal_pages') {
+      if (hasRequestedEditorialChanges(target) || hasRequestedSimpleDrupalChanges(target)) {
         const editorial = await applyEditorialChanges(target, before.values);
         mergeApplyResult(report, editorial);
-        const taxonomy = await applyTaxonomyChanges(target, before.values);
-        mergeApplyResult(report, taxonomy);
-      } else {
+      }
+      if (hasRequestedTaxonomyChanges(target)) {
         const taxonomy = await applyTaxonomyChanges(target, before.values);
         mergeApplyResult(report, taxonomy);
       }
+      assertOnlyRequestedFieldsUpdated(target, report);
       report.after = { ...before.values, ...report.after };
       report.status = deriveReportStatus(report);
       return report;
@@ -1738,16 +1951,24 @@
 
   async function readCurrentDrupalValues(target) {
     const requestedFields = getRequestedFields(target);
-    const values = {}, titleInput = findElementBySelectors(SELECTORS.title);
-    const result = { title: titleInput?.value || '', values, fullHtml: '', thematics: [], metiersPublics: [], departements: [] };
-    if (requestedFields.includes('title') || Object.prototype.hasOwnProperty.call(target.expectedBefore || {}, 'title')) values.title = result.title;
-    const htmlFields = requestedFields.filter((field) => resolveDrupalTargetField(target.payloadType, field) === 'editorialPublics' || EDITORIAL_FIELDS.includes(field));
-    if (htmlFields.length || Object.keys(target.expectedBefore || {}).some((field) => EDITORIAL_FIELDS.includes(field))) {
+    const values = {};
+    const result = { title: target.requestedTitle || target.title || '', values, fullHtml: '', thematics: [], metiersPublics: [], departements: [] };
+    if (requestedFields.includes('title')) {
+      const titleInput = findElementBySelectors(SELECTORS.title);
+      result.title = titleInput?.value || '';
+      values.title = result.title;
+    }
+    const htmlFields = requestedFields.filter((field) => {
+      const resolved = resolveDrupalTargetField(target.payloadType, field);
+      return resolved === 'editorialPublics' || EDITORIAL_FIELDS.includes(resolved);
+    });
+    if (htmlFields.length) {
       await prepareFormationEditor(target);
       result.fullHtml = await getCurrentHtmlFromEditor();
-      Object.assign(values, extractRequestedFormationHtmlValues(result.fullHtml, [...new Set([...htmlFields, ...Object.keys(target.expectedBefore || {}).filter((field) => EDITORIAL_FIELDS.includes(field))])]));
+      Object.assign(values, extractRequestedFormationHtmlValues(result.fullHtml, htmlFields));
     }
-    for (const originalField of requestedFields.filter((field) => ['theme', 'thematiques', 'metiersPublics', 'departements', 'lieux'].includes(field) || (['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(target.payloadType) && field === 'publics'))) {
+    const taxonomyFieldsToRead = requestedFields.filter((field) => ['theme', 'thematiques', 'metiersPublics', 'departements'].includes(field) || (target.payloadType === 'bulk_drupal_theme_public_update' && field === 'publics'));
+    for (const originalField of taxonomyFieldsToRead) {
       const field = resolveDrupalTargetField(target.payloadType, originalField);
       const current = readTaxonomyField(field);
       values[originalField] = current;
@@ -1759,9 +1980,34 @@
     return result;
   }
 
-  function getRequestedFields(target) { return Object.keys(['update_drupal_pages', 'bulk_drupal_theme_public_update'].includes(target.payloadType) ? target.changes || {} : target.expectedAfter || {}); }
+  function getRequestedFields(target) { return Object.keys(target.changes || {}); }
+
+  function getResolvedRequestedFields(target) {
+    return getRequestedFields(target).map((field) => resolveDrupalTargetField(target.payloadType, field));
+  }
+
+  function hasRequestedEditorialChanges(target) {
+    return getResolvedRequestedFields(target).some((field) => field === 'editorialPublics' || EDITORIAL_FIELDS.includes(field));
+  }
+
+  function hasRequestedTaxonomyChanges(target) {
+    return getResolvedRequestedFields(target).some((field) => TAXONOMY_FIELDS.includes(field));
+  }
+
+  function hasRequestedSimpleDrupalChanges(target) {
+    return getResolvedRequestedFields(target).some((field) => ['title', 'publicationDate', 'preinscriptionStartDate', 'unpublishDate', 'preinscriptionLinks'].includes(field));
+  }
+
+  function isTaxonomyOnlyTarget(target) {
+    return hasRequestedTaxonomyChanges(target) && !hasRequestedEditorialChanges(target) && !hasRequestedSimpleDrupalChanges(target);
+  }
+
+  function logIntranetTargetMode(target, workflowType = state.activeWorkflow) {
+    log('info', target, `Node ${target.nodeId} — Payload : ${target.payloadType}; Workflow : ${workflowType}; Champs explicitement demandés : ${getRequestedFields(target).join(', ') || '(aucun)'}; Cible limitée aux taxonomies : ${isTaxonomyOnlyTarget(target) ? 'oui' : 'non'}; CKEditor autorisé : ${hasRequestedEditorialChanges(target) ? 'oui' : 'non'}; Workflow Sofia autorisé : ${workflowType === 'sofia' ? 'oui' : 'non'}.`);
+  }
 
   async function prepareFormationEditor(target) {
+    if (!hasRequestedEditorialChanges(target)) throw typedError('unauthorized_field_access', `ERREUR : tentative de modification d’un champ non demandé — ouverture de CKEditor refusée pour le Node ${target.nodeId}.`);
     await clickFormationBodyEditBeforeRichText(target);
     const format = await waitForAnySelector(SELECTORS.textFormat, CONFIG.MAX_WAIT_TIME).catch(() => null);
     if (format && format.value !== CONFIG.ADVANCED_FORMAT_VALUE) { setSelectValue(format, CONFIG.ADVANCED_FORMAT_VALUE); await waitForAjax(); }
@@ -1890,27 +2136,35 @@
 
   async function applyTaxonomyChanges(target) {
     const result = emptyApplyResult();
-    const desiredEntries = target.payloadType === 'bulk_drupal_taxonomy_update'
-      ? Object.entries(target.expectedAfter || {})
-      : Object.entries(target.changes || {}).filter(([field]) => TAXONOMY_FIELDS.includes(field) || (target.payloadType === 'bulk_drupal_theme_public_update' && field === 'publics'));
+    const desiredEntries = Object.entries(target.changes || {}).filter(([field]) => TAXONOMY_FIELDS.includes(field) || (target.payloadType === 'bulk_drupal_theme_public_update' && field === 'publics'));
+    if (desiredEntries.length) log('info', target, `Node ${target.nodeId} — taxonomies demandées : ${desiredEntries.map(([field]) => field).join(', ')}`);
     for (const [originalField, request] of desiredEntries) {
       const field = resolveDrupalTargetField(target.payloadType, originalField);
-      if (!['theme', 'metiersPublics', 'departements', 'lieux'].includes(field)) continue;
-      const desired = ['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(target.payloadType) ? normalizeTerms(target.expectedAfter?.[originalField]) : normalizeTerms(request.value);
-      const current = readTaxonomyField(field);
-      if (compareTaxonomySets(current, desired)) { unchangedField(result, originalField, current); continue; }
+      if (!['theme', 'metiersPublics', 'departements'].includes(field)) continue;
+      const desired = target.payloadType === 'bulk_drupal_theme_public_update' ? normalizeTerms(request.values) : normalizeTerms(request.value);
       try {
+        const current = readTaxonomyField(field);
+        if (field === 'theme') log('info', target, `Thématiques actuelles : ${JSON.stringify(current)}. Thématiques attendues : ${JSON.stringify(desired)}.`);
+        if (field === 'metiersPublics') log('info', target, `Publics actuels : ${JSON.stringify(current)}. Publics attendus : ${JSON.stringify(desired)}.`);
+        if (compareTaxonomySets(current, desired)) {
+          unchangedField(result, originalField, current);
+          log('success', target, `${field === 'theme' ? 'Thématiques' : 'Publics'} vérifiées avec succès.`);
+          continue;
+        }
         if (field === 'theme') await applyThematicsExpectedState(desired);
         else {
-          const labels = field === 'metiersPublics' ? ['Métiers', 'Métier', 'Publics', 'Public'] : field === 'departements' ? ['Zone géographique', 'Départements', 'Département'] : ['Tags de lieux', 'Lieux'];
-          const container = findTaxonomyContainerByLabel(labels);
-          if (!container) throw typedError('field_not_found', `Champ Drupal distinct ${field} introuvable.`);
+          const container = field === 'metiersPublics' ? findPublicTreeContainer() : findTaxonomyContainerByLabel(['Zone géographique', 'Départements', 'Département']);
+          if (!container) throw typedError('field_not_found', field === 'metiersPublics' ? 'Champ publics introuvable : #edit-field-metier-tags-wrapper absent' : `Champ Drupal distinct ${field} introuvable.`);
           await applyFancyTreeExpectedState(container, desired);
         }
         const after = readTaxonomyField(field);
         if (!compareTaxonomySets(after, desired)) throw typedError('field_not_found', `Valeur finale incorrecte pour ${originalField}.`);
         updatedField(result, originalField, current, after);
-      } catch (error) { failField(result, originalField, error.code || 'field_not_found', error.message); }
+        log('success', target, `${field === 'theme' ? 'Thématiques' : 'Publics'} vérifiées avec succès.`);
+      } catch (error) {
+        log('error', target, error.message);
+        failField(result, originalField, error.code || 'field_not_found', error.message);
+      }
     }
     return result;
   }
@@ -1918,43 +2172,291 @@
   function normalizeTerms(value) { return (Array.isArray(value) ? value : String(value ?? '').split(/[;,|\n]/)).map((term) => typeof term === 'object' ? String(term.label || term.name || '') : String(term)).map((term) => term.trim()).filter(Boolean); }
   function normalizedTaxonomySet(terms) { return [...new Set(normalizeTerms(terms).map(normalizeText))].sort(); }
   function compareTaxonomySets(a, b) { return JSON.stringify(normalizedTaxonomySet(a)) === JSON.stringify(normalizedTaxonomySet(b)); }
+
+
+  /***************************************************************************
+   * THÉMATIQUES / PUBLICS — import du module isolé
+   *
+   * Sélectionne uniquement des termes déjà existants dans Drupal : aucune
+   * création de termes de taxonomie n'est effectuée ici.
+   ***************************************************************************/
+  async function applyPublicsAndThematicsFromSource(item = {}, exportData = {}) {
+    await applyMappedThematics({ item, exportData });
+    await applyMappedPublics({ item, exportData });
+  }
+
+  /***************************************************************************
+   * THÉMATIQUES
+   ***************************************************************************/
+  async function applyMappedThematics({ item = {}, exportData = {} } = {}) {
+    const thematics = resolveMappedThematics({ item, exportData });
+    if (!thematics.length) { log('info', item, 'Aucune thématique à ajouter.'); return []; }
+    log('info', item, `Thématiques à ajouter : ${thematics.join(', ')}.`);
+    let current = readTaxonomyField('theme');
+    for (const thematic of thematics) {
+      if (current.some((value) => normalizeText(value) === normalizeText(thematic))) continue;
+      await addAutocompleteTermExact(thematic);
+      current = readTaxonomyField('theme');
+    }
+    return thematics;
+  }
+
+  function resolveMappedThematics({ item = {}, exportData = {} } = {}) {
+    const rawTheme = [exportData.theme, item.theme].filter(Boolean).join(', ');
+    const normalizedTheme = normalize(rawTheme);
+    const values = [];
+    CONFIG.THEMATIC_ALIAS_MAP.forEach(([aliases, thematicIds]) => {
+      if (!aliases.some((alias) => normalizedTheme.includes(normalize(alias)))) return;
+      thematicIds.forEach((thematicId) => {
+        const value = String(thematicId).trim();
+        if (value && !values.includes(value)) values.push(value);
+      });
+    });
+    CONFIG.REQUIRED_THEMATICS.forEach((thematic) => {
+      const value = String(thematic).trim();
+      if (value && !values.includes(value)) values.push(value);
+    });
+    return values;
+  }
+
+  async function getThematicInputByIndex(index) {
+    await waitForAnySelector(SELECTORS.thematics, CONFIG.MAX_WAIT_TIME);
+    const inputs = Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible);
+    const input = inputs[index] || inputs.find((candidate) => !candidate.value) || inputs.at(-1);
+    if (!input) throw new Error(`Champ thématique introuvable pour l'index ${index}.`);
+    return input;
+  }
+
+  async function fillThematicAutocomplete(input, value) {
+    if (!input) throw new Error(`Champ d'autocomplétion introuvable pour : ${value}.`);
+    setValue(input, value);
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    await sleep(Math.max(CONFIG.DELAY_BETWEEN_ACTIONS, CONFIG.THEMATIC_AUTOCOMPLETE_DELAY_MS));
+    await waitForFunction(() => visibleAutocompleteSuggestions().length > 0, 5000, `Suggestion thématique introuvable : ${value}.`);
+    const normalizedValue = normalize(value);
+    const suggestions = visibleAutocompleteSuggestions();
+    const matches = suggestions.filter((element) => {
+      const text = normalize(element.textContent);
+      return text.includes(normalizedValue) || text.includes(`(${normalizedValue})`);
+    });
+    if (!matches.length) throw new Error(`Suggestion thématique introuvable pour la valeur recherchée : ${value}.`);
+    await safeClick(matches[0], `Valider l'autocomplétion : ${value}`);
+    await waitForFunction(() => normalize(input.value) !== normalizedValue || !isVisible(input), 3000, `Thématique non validée par Drupal : ${value}.`);
+    await sleep(Math.max(CONFIG.DELAY_BETWEEN_ACTIONS, CONFIG.THEMATIC_AUTOCOMPLETE_SELECTION_DELAY_MS));
+    await waitForAjax();
+  }
+
+  function visibleAutocompleteSuggestions() {
+    return Array.from(document.querySelectorAll('.ui-autocomplete li, .ui-menu-item, [role="option"]')).filter(isVisible);
+  }
+
+  /***************************************************************************
+   * PUBLICS
+   ***************************************************************************/
+  async function applyMappedPublics({ item = {}, exportData = {} } = {}) {
+    const publics = uniquePublicEntries([...(Array.isArray(exportData.publics) ? exportData.publics : exportData.publics ? [exportData.publics] : []), ...(Array.isArray(item.publics) ? item.publics : item.publics ? [item.publics] : [])]);
+    if (!publics.length) {
+      await clickFancytreeTitle('Tous les personnels', 'Sélectionner le métier par défaut : Tous les personnels', { optional: true, scopeSelector: SELECTORS.publicTreeWrapper[0] });
+      return ['Tous les personnels'];
+    }
+    const selectedPaths = [];
+    for (const entry of publics) {
+      const path = publicPath(entry);
+      if (!path.length) continue;
+      const selected = await clickFancytreePath(SELECTORS.publicTreeWrapper[0], path, `Sélectionner le métier : ${path.join(' > ')}`, { optional: true });
+      if (selected) selectedPaths.push(path.join(' > '));
+    }
+    return selectedPaths;
+  }
+
+  async function clickFancytreePath(scopeSelector, path, message, options = {}) {
+    const cleanPath = path.map(String).map((value) => value.trim()).filter(Boolean);
+    for (const title of cleanPath.slice(0, -1)) await ensureFancytreeExpanded(title, { ...options, scopeSelector });
+    return clickFancytreeTitle(cleanPath.at(-1), message, { ...options, scopeSelector });
+  }
+
+  async function ensureFancytreeExpanded(title, options = {}) {
+    const node = findFancytreeNode(title, options);
+    if (!node) { if (options.optional) { log('warning', null, `Nœud public optionnel introuvable : ${title}.`); return false; } throw new Error(`Nœud Fancytree introuvable : ${title}.`); }
+    const treeItem = node.closest('[role="treeitem"],li');
+    const isExpanded = treeItem?.getAttribute('aria-expanded') === 'true' || node.classList.contains('fancytree-expanded') || treeItem?.classList.contains('fancytree-expanded');
+    if (!isExpanded) {
+      const expander = node.querySelector('.fancytree-expander') || node.closest('.fancytree-node,li')?.querySelector('.fancytree-expander');
+      if (expander) { await safeClick(expander, `Dérouler ${title}`); await waitForAjax(); }
+    }
+    return true;
+  }
+
+  async function clickFancytreeTitle(title, message, options = {}) {
+    await waitForFunction(() => findFancytreeNode(title, options) || options.optional, 8000, `Public introuvable : ${title}.`);
+    const node = findFancytreeNode(title, options);
+    if (!node) { log('warning', null, `Champ public optionnel non trouvé : ${title}.`); return false; }
+    const checkbox = node.querySelector('.fancytree-checkbox,input[type="checkbox"]') || node.closest('.fancytree-node,li')?.querySelector('.fancytree-checkbox,input[type="checkbox"]');
+    if (!checkbox) { if (options.optional) { log('warning', null, `Checkbox publique optionnelle introuvable : ${title}.`); return false; } throw new Error(`Checkbox Fancytree introuvable : ${title}.`); }
+    const treeItem = node.closest('[role="treeitem"],li');
+    const isSelected = treeItem?.getAttribute('aria-selected') === 'true' || node.classList.contains('fancytree-selected') || node.classList.contains('fancytree-partsel') || checkbox.checked || checkbox.getAttribute('aria-checked') === 'true';
+    if (!isSelected) { await safeClick(checkbox, message); await waitForAjax(); }
+    else log('info', null, `Public déjà sélectionné : ${title}.`);
+    return true;
+  }
+
+  function findFancytreeNode(title, options = {}) {
+    const wanted = normalize(title), scope = options.scopeSelector ? document.querySelector(options.scopeSelector) : document;
+    if (!scope) return null;
+    return Array.from(scope.querySelectorAll('.fancytree-node,li')).find((node) => {
+      const text = normalize(node.querySelector('.fancytree-title,label')?.textContent || '');
+      return options.contains ? text.includes(wanted) : text === wanted;
+    }) || null;
+  }
+
+  function uniquePublicEntries(values) {
+    const seen = new Set();
+    return values.filter((value) => {
+      if (!value) return false;
+      const key = typeof value === 'string' ? normalize(value) : normalize(value.id || value.path || value.label);
+      if (!key || seen.has(key)) return false;
+      seen.add(key); return true;
+    });
+  }
+
+  function publicPath(value) {
+    if (typeof value === 'string') return [value.trim()].filter(Boolean);
+    if (value?.path) return String(value.path).split('>').map((part) => part.trim()).filter(Boolean);
+    return [value?.label || value?.id].map((entry) => String(entry || '').trim()).filter(Boolean);
+  }
+
+  /***************************************************************************
+   * DÉPENDANCES PARTAGÉES
+   *
+   * Ces alias réutilisent les utilitaires historiques du script cible pour
+   * éviter toute deuxième implémentation conflictuelle.
+   ***************************************************************************/
+  const safeClick = clickElement;
+  const setValue = setInputValue;
+  const normalize = normalizeText;
   function findTaxonomyContainerByLabel(labels) {
     const wanted = labels.map(normalizeText), candidates = Array.from(document.querySelectorAll('fieldset,.form-item,.field--widget-fancytree,.js-form-wrapper'));
     return candidates.filter((container) => { const label = container.querySelector(':scope > legend, :scope > label, :scope > .fieldset-legend, :scope > .form-item__label'); return label && wanted.includes(normalizeText(label.textContent)); }).sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length)[0] || null;
   }
-  function getSelectedFancyTreeTerms(container) { return Array.from(container?.querySelectorAll('.fancytree-selected,.fancytree-active[aria-selected="true"],input[type="checkbox"]:checked') || []).map((node) => node.closest('.fancytree-node,li,label')?.querySelector('.fancytree-title')?.textContent || node.closest('label')?.textContent || node.textContent).map((label) => String(label || '').trim()).filter(Boolean); }
-  function findFancyTreeNodeExact(container, label) { const matches = Array.from(container.querySelectorAll('.fancytree-node,li')).filter((node) => normalizeText(node.querySelector('.fancytree-title,label')?.textContent || '') === normalizeText(label)); if (matches.length > 1) throw typedError('ambiguous_term', `Terme ambigu : ${label}.`); return matches[0] || null; }
-  async function expandFancyTreeAncestors(node) { const ancestors = []; for (let parent = node?.parentElement?.closest('.fancytree-node,li'); parent; parent = parent.parentElement?.closest('.fancytree-node,li')) ancestors.unshift(parent); for (const ancestor of ancestors) { const expander = ancestor.querySelector(':scope > .fancytree-expander, :scope > span > .fancytree-expander'); if (expander && !ancestor.classList.contains('fancytree-expanded')) { await clickElement(expander, 'Déplier la taxonomie'); await waitForAjax(); } } }
-  async function setFancyTreeNodeChecked(node, checked) { const checkbox = node.querySelector(':scope input[type="checkbox"],input[type="checkbox"],.fancytree-checkbox'); const selected = node.classList.contains('fancytree-selected') || checkbox?.checked || checkbox?.getAttribute('aria-checked') === 'true'; if (Boolean(selected) !== Boolean(checked)) { await clickElement(checkbox || node.querySelector('.fancytree-title,label'), `${checked ? 'Sélectionner' : 'Désélectionner'} le terme exact`); await waitForAjax(); } }
-  async function applyFancyTreeExpectedState(container, expectedTerms) {
-    const expected = normalizeTerms(expectedTerms), selected = getSelectedFancyTreeTerms(container);
-    for (const label of selected.filter((term) => !expected.some((wanted) => normalizeText(wanted) === normalizeText(term)))) { const node = findFancyTreeNodeExact(container, label); if (node) await setFancyTreeNodeChecked(node, false); }
-    for (const label of expected.filter((wanted) => !selected.some((term) => normalizeText(wanted) === normalizeText(term)))) { const node = findFancyTreeNodeExact(container, label); if (!node) throw typedError('field_not_found', `Terme de taxonomie introuvable : ${label}.`); await expandFancyTreeAncestors(node); await setFancyTreeNodeChecked(node, true); }
-    const final = getSelectedFancyTreeTerms(container); if (!compareTaxonomySets(final, expected)) throw typedError('field_not_found', 'État final du FancyTree différent de expectedAfter.'); return final;
+  function findPublicTreeContainer() {
+    return document.querySelector(SELECTORS.publicTreeWrapper[0]) || findTaxonomyContainerByLabel(['Métiers', 'Métier', 'Publics', 'Public']);
   }
+
+  function getSelectedFancyTreeTerms(container) {
+    if (!container) throw typedError('field_not_found', 'Champ publics introuvable : #edit-field-metier-tags-wrapper absent');
+    const values = [];
+    const add = (value) => { const clean = String(value || '').trim(); if (clean && !values.some((entry) => normalizeText(entry) === normalizeText(clean))) values.push(clean); };
+    Array.from(container.querySelectorAll('.fancytree-node.fancytree-selected')).forEach((node) => add(node.querySelector('.fancytree-title')?.textContent || ''));
+    Array.from(container.querySelectorAll('.fancytree-node input[type="checkbox"]:checked')).forEach((checkbox) => add(checkbox.closest('.fancytree-node')?.querySelector('.fancytree-title')?.textContent || ''));
+    return values;
+  }
+
+  function findFancyTreeNodeExact(container, label) {
+    if (!container) throw typedError('field_not_found', 'Champ publics introuvable : #edit-field-metier-tags-wrapper absent');
+    const wanted = normalizeText(label);
+    const matches = Array.from(container.querySelectorAll('.fancytree-node')).filter((node) => normalizeText(node.querySelector('.fancytree-title')?.textContent || '') === wanted);
+    if (matches.length > 1) throw typedError('ambiguous_term', `Plusieurs nœuds Fancytree portent exactement le libellé : ${label}`);
+    return matches[0] || null;
+  }
+
+  async function expandFancyTreeAncestors(node) {
+    const ancestors = [];
+    for (let li = node?.closest('li')?.parentElement?.closest('li'); li; li = li.parentElement?.closest('li')) ancestors.unshift(li);
+    for (const ancestor of ancestors) {
+      const ancestorNode = ancestor.querySelector(':scope > .fancytree-node');
+      const expander = ancestorNode?.querySelector(':scope .fancytree-expander');
+      const expanded = ancestor.classList.contains('fancytree-expanded') || ancestorNode?.classList.contains('fancytree-expanded') || ancestor.getAttribute('aria-expanded') === 'true';
+      if (expander && !expanded) { await clickElement(expander, 'Déplier la taxonomie'); await waitForAjax(); }
+    }
+  }
+
+  async function setFancyTreeNodeChecked(node, checked) {
+    const checkbox = node.querySelector('input[type="checkbox"],.fancytree-checkbox');
+    const selected = node.classList.contains('fancytree-selected') || checkbox?.checked || checkbox?.getAttribute('aria-checked') === 'true';
+    if (Boolean(selected) !== Boolean(checked)) { await clickElement(checkbox || node.querySelector('.fancytree-title'), `${checked ? 'Sélectionner' : 'Désélectionner'} le terme exact`); await waitForAjax(); }
+  }
+
+  async function applyFancyTreeExpectedState(container, expectedTerms) {
+    const expected = normalizeTerms(expectedTerms);
+    let selected = getSelectedFancyTreeTerms(container);
+    for (const label of selected.filter((term) => !expected.some((wanted) => normalizeText(wanted) === normalizeText(term)))) {
+      const node = findFancyTreeNodeExact(container, label);
+      if (node) { await expandFancyTreeAncestors(node); await setFancyTreeNodeChecked(node, false); }
+    }
+    selected = getSelectedFancyTreeTerms(container);
+    for (const label of expected.filter((wanted) => !selected.some((term) => normalizeText(wanted) === normalizeText(term)))) {
+      const node = findFancyTreeNodeExact(container, label);
+      if (!node) throw typedError('field_not_found', `Public introuvable dans Fancytree : ${label}`);
+      await expandFancyTreeAncestors(node);
+      await setFancyTreeNodeChecked(node, true);
+    }
+    const final = getSelectedFancyTreeTerms(container);
+    if (!compareTaxonomySets(final, expected)) throw typedError('field_not_found', 'État final du FancyTree différent de expectedAfter.');
+    return final;
+  }
+
   function readTaxonomyField(field) {
-    if (field === 'theme') return Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).map((input) => input.value.replace(/\s*\([^)]*\)\s*$/, '').trim()).filter(Boolean);
-    const labels = field === 'metiersPublics' ? ['Métiers', 'Métier', 'Publics', 'Public'] : field === 'departements' ? ['Zone géographique', 'Départements', 'Département'] : ['Tags de lieux', 'Lieux'];
-    const container = findTaxonomyContainerByLabel(labels); return container ? getSelectedFancyTreeTerms(container) : [];
+    if (field === 'theme') {
+      const inputs = Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible);
+      if (!inputs.length) throw typedError('field_not_found', 'Champ Thématiques Drupal introuvable.');
+      return inputs.map((input) => input.value.replace(/\s*\([^)]*\)\s*$/, '').trim()).filter(Boolean);
+    }
+    const container = field === 'metiersPublics' ? findPublicTreeContainer() : findTaxonomyContainerByLabel(['Zone géographique', 'Départements', 'Département']);
+    if (!container) throw typedError('field_not_found', field === 'metiersPublics' ? 'Champ publics introuvable : #edit-field-metier-tags-wrapper absent' : `Champ Drupal distinct ${field} introuvable.`);
+    return getSelectedFancyTreeTerms(container);
   }
   async function applyThematicsExpectedState(expectedTerms) {
-    const inputs = Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible);
-    if (!inputs.length) throw typedError('field_not_found', 'Champ Thématiques Drupal introuvable.');
-    const current = inputs.map((input) => input.value.replace(/\s*\([^)]*\)\s*$/, '').trim()).filter(Boolean);
-    for (const input of inputs.filter((entry) => entry.value && !expectedTerms.some((term) => normalizeText(term) === normalizeText(entry.value.replace(/\s*\([^)]*\)\s*$/, ''))))) {
-      const remove = input.closest('.form-item,.field-multiple-table tr')?.querySelector('input[value="Retirer"],button[aria-label*="Retirer"],input[name*="remove_button"]');
-      if (!remove) throw typedError('field_not_found', `Bouton de suppression thématique introuvable pour ${input.value}.`);
-      await clickElement(remove, 'Retirer la thématique exacte'); await waitForAjax();
+    const expected = normalizeTerms(expectedTerms);
+    let current = readTaxonomyField('theme');
+    for (const value of current.filter((entry) => !expected.some((term) => normalizeText(term) === normalizeText(entry)))) {
+      const input = findThematicInputByCurrentValue(value);
+      if (!input) throw typedError('field_not_found', `Champ thématique introuvable pour suppression : ${value}.`);
+      const row = input.closest('tr') || input.closest('.field-multiple-table') || input.closest('.form-item');
+      const remove = row?.querySelector('input[value="Retirer"],button[value="Retirer"],button[aria-label*="Retirer"],input[name*="remove_button"]');
+      if (!remove) throw typedError('field_not_found', `Bouton de suppression thématique introuvable pour ${value}.`);
+      await clickElement(remove, 'Retirer la thématique exacte');
+      await waitForAjax();
+      current = readTaxonomyField('theme');
     }
-    for (const label of expectedTerms.filter((term) => !current.some((value) => normalizeText(value) === normalizeText(term)))) await addAutocompleteTermExact(label);
+    current = readTaxonomyField('theme');
+    for (const label of expected.filter((term) => !current.some((value) => normalizeText(value) === normalizeText(term)))) {
+      await addAutocompleteTermExact(label);
+      current = readTaxonomyField('theme');
+    }
   }
+
+  function findThematicInputByCurrentValue(value) {
+    return Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible).find((input) => normalizeText(input.value.replace(/\s*\([^)]*\)\s*$/, '')) === normalizeText(value)) || null;
+  }
+
+  async function getOrCreateEmptyThematicInput() {
+    let inputs = Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible);
+    let emptyInput = inputs.find((input) => !input.value.trim());
+    if (emptyInput) return emptyInput;
+
+    const addButton = await waitForAnySelector(SELECTORS.thematicAddMore, CONFIG.MAX_WAIT_TIME);
+    await clickElement(addButton, 'Ajouter un autre élément thématique');
+    await waitForAjax();
+
+    inputs = Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible);
+    emptyInput = inputs.find((input) => !input.value.trim());
+    if (!emptyInput) throw typedError('field_not_found', 'Aucune nouvelle ligne thématique vide après le clic Ajouter un autre élément.');
+    return emptyInput;
+  }
+
   async function addAutocompleteTermExact(label) {
-    const input = Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible).find((entry) => !entry.value) || Array.from(document.querySelectorAll(SELECTORS.thematics.join(','))).filter(isVisible).at(-1);
-    if (!input) throw typedError('field_not_found', 'Ligne vide Thématiques introuvable.');
+    const input = await getOrCreateEmptyThematicInput();
     setInputValue(input, label);
-    const suggestion = await waitForFunction(() => Array.from(document.querySelectorAll('.ui-autocomplete li,.ui-menu-item,[role="option"]')).filter(isVisible).filter((entry) => normalizeText(entry.textContent.replace(/\s*\([^)]*\)\s*$/, '')) === normalizeText(label)), CONFIG.MAX_WAIT_TIME, `Suggestion exacte introuvable : ${label}.`);
-    if (suggestion.length !== 1) throw typedError(suggestion.length > 1 ? 'ambiguous_term' : 'field_not_found', `Suggestion ${label} ambiguë ou absente.`);
-    await clickElement(suggestion[0], `Choisir la suggestion exacte ${label}`); await waitForAjax();
+    const normalizedLabel = normalizeText(label);
+    const suggestions = await waitForFunction(() => Array.from(document.querySelectorAll('.ui-autocomplete li,.ui-menu-item,[role="option"]')).filter(isVisible).filter((entry) => {
+      const full = normalizeText(entry.textContent || '');
+      const withoutId = normalizeText((entry.textContent || '').replace(/\s*\([^)]*\)\s*$/, ''));
+      return withoutId === normalizedLabel || full.includes(`(${normalizedLabel})`);
+    }), CONFIG.MAX_WAIT_TIME, `Suggestion thématique introuvable : ${label}`);
+    if (suggestions.length !== 1) throw typedError(suggestions.length > 1 ? 'ambiguous_term' : 'field_not_found', `Suggestion thématique introuvable : ${label}`);
+    await clickElement(suggestions[0], `Choisir la suggestion exacte ${label}`);
+    await waitForAjax();
+    await waitForFunction(() => normalizeText(input.value) !== normalizedLabel || !isVisible(input), 3000, `Thématique non validée par Drupal : ${label}`);
   }
 
   function readSimpleDrupalFields(target, values) {
@@ -1983,13 +2485,23 @@
 
   function compareExpectedBefore(target, current) {
     const differences = [];
+    const requestedFields = new Set(getRequestedFields(target));
     Object.entries(target.expectedBefore || {}).forEach(([field, expected]) => {
+      if (!requestedFields.has(field)) return;
       const actual = current[field];
-      const taxonomy = Array.isArray(expected) || ['theme', 'thematiques', 'metiersPublics', 'departements', 'lieux'].includes(resolveDrupalTargetField(target.payloadType, field)) || (['bulk_drupal_taxonomy_update', 'bulk_drupal_theme_public_update'].includes(target.payloadType) && field === 'publics');
+      const resolvedField = resolveDrupalTargetField(target.payloadType, field);
+      const taxonomy = Array.isArray(expected) || ['theme', 'metiersPublics', 'departements'].includes(resolvedField);
       const same = taxonomy ? compareTaxonomySets(actual, expected) : compareTextValues(actual, expected);
       if (!same) differences.push({ field, expected, actual, code: 'conflict', message: `expectedBefore différent pour ${field}.` });
     });
     return differences;
+  }
+
+  function assertOnlyRequestedFieldsUpdated(target, report) {
+    const requested = new Set(getRequestedFields(target));
+    report.updatedFields.forEach((field) => {
+      if (!requested.has(field)) throw typedError('unauthorized_field_change', `ERREUR : tentative de modification d’un champ non demandé : ${field}.`);
+    });
   }
   function emptyApplyResult() { return { updatedFields: [], unchangedFields: [], failedFields: [], before: {}, after: {}, errors: [], verified: true }; }
   function updatedField(result, field, before, after) { if (!result.updatedFields.includes(field)) result.updatedFields.push(field); result.before[field] = before; result.after[field] = after; }
@@ -2010,7 +2522,8 @@
   function safeFilename(value) { return String(value || 'batch').replace(/[^a-z0-9._-]+/gi, '-'); }
   function buildIntranetSaveOptions(report, workflowType) {
     const safe = state.intranetUpdate.payload.settings?.safeMode === true;
-    return { workflowType, forbidden: safe || !report.updatedFields.length, conflict: report.status === 'conflict', fieldsValid: !report.failedFields.length, verified: report._verified, backupGenerated: state.intranetUpdate.backupGenerated, reason: safe ? 'Enregistrement interdit par le mode sécurisé du fichier importé.' : !report.updatedFields.length ? 'Aucun changement : enregistrement inutile.' : report.failedFields.length ? 'Enregistrement interdit : certains champs demandés sont introuvables ou non vérifiés.' : '' };
+    const unauthorized = report.status === 'unauthorized_field_change' || report.errors.some((error) => error.code === 'unauthorized_field_change' || error.code === 'unauthorized_field_access' || error.code === 'workflow_mismatch');
+    return { workflowType, forbidden: safe || unauthorized || !report.updatedFields.length, conflict: report.status === 'conflict', fieldsValid: !report.failedFields.length && !unauthorized, verified: report._verified, backupGenerated: state.intranetUpdate.backupGenerated, reason: unauthorized ? 'Enregistrement interdit : tentative de modification ou accès à un champ non demandé.' : safe ? 'Enregistrement interdit par le mode sécurisé du fichier importé.' : !report.updatedFields.length ? 'Aucun changement : enregistrement inutile.' : report.failedFields.length ? 'Enregistrement interdit : certains champs demandés sont introuvables ou non vérifiés.' : '' };
   }
   function finalizeIntranetReportItem(report, saved) {
     report.saved = Boolean(saved);
