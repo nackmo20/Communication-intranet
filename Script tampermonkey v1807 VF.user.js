@@ -2444,19 +2444,106 @@
     return emptyInput;
   }
 
+  function setAutocompleteInputValue(input, value) {
+    input.scrollIntoView({ block: 'center', inline: 'center' });
+    input.focus();
+    const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    if (nativeSetter) nativeSetter.call(input, String(value));
+    else input.value = String(value);
+    input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+    input.dispatchEvent(new KeyboardEvent('keyup', { key: String(value).slice(-1), bubbles: true, cancelable: true }));
+  }
+
+  function getAutocompleteMenuForInput(input) {
+    const menuId = input.getAttribute('aria-controls') || input.getAttribute('aria-owns');
+    if (menuId) {
+      const menu = document.getElementById(menuId);
+      if (menu && isVisible(menu)) return menu;
+    }
+    return Array.from(document.querySelectorAll('.ui-autocomplete')).find(isVisible) || null;
+  }
+
+  function findExactThematicSuggestion(input, expectedValue) {
+    const menu = getAutocompleteMenuForInput(input);
+    if (!menu) return null;
+    const wrappers = Array.from(menu.querySelectorAll('a.ui-menu-item-wrapper, .ui-menu-item-wrapper')).filter(isVisible);
+    const wanted = normalizeText(expectedValue);
+    const match = wrappers.find((wrapper) => {
+      const rawText = String(wrapper.textContent || '').trim();
+      const normalizedFullText = normalizeText(rawText);
+      const normalizedLabel = normalizeText(rawText.replace(/\s*\([^)]*\)\s*$/, ''));
+      const idMatch = rawText.match(/\(([^()]*)\)\s*$/);
+      const normalizedId = normalizeText(idMatch?.[1] || '');
+      return normalizedId === wanted || normalizedLabel === wanted || normalizedFullText === wanted;
+    }) || null;
+    return match;
+  }
+
+  function clickAutocompleteWrapper(wrapper) {
+    wrapper.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    log('info', null, `Clic direct sur ${String(wrapper.tagName).toLowerCase()}.ui-menu-item-wrapper`);
+    ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
+      wrapper.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+    });
+    if (String(wrapper.tagName).toLowerCase() === 'a') wrapper.click();
+  }
+
+  function isThematicInputValidated(input, expectedValue) {
+    const currentValue = String(input?.value || '').trim();
+    const expected = normalizeText(expectedValue);
+    const current = normalizeText(currentValue);
+    if (!currentValue) return false;
+    if (current === expected) return false;
+    if (current.includes(`(${expected})`)) return true;
+    const idMatch = currentValue.match(/\(([^()]*)\)\s*$/);
+    return normalizeText(idMatch?.[1] || '') === expected;
+  }
+
   async function addAutocompleteTermExact(label) {
+    if (CONFIG.SAFE_CLICK_MODE && !window.confirm(`Ajouter la thématique ${label} ?`)) {
+      throw new Error(`Clic annulé par l’utilisateur : ajouter la thématique ${label}.`);
+    }
+
     const input = await getOrCreateEmptyThematicInput();
-    setInputValue(input, label);
-    const normalizedLabel = normalizeText(label);
-    const suggestions = await waitForFunction(() => Array.from(document.querySelectorAll('.ui-autocomplete li,.ui-menu-item,[role="option"]')).filter(isVisible).filter((entry) => {
-      const full = normalizeText(entry.textContent || '');
-      const withoutId = normalizeText((entry.textContent || '').replace(/\s*\([^)]*\)\s*$/, ''));
-      return withoutId === normalizedLabel || full.includes(`(${normalizedLabel})`);
-    }), CONFIG.MAX_WAIT_TIME, `Suggestion thématique introuvable : ${label}`);
-    if (suggestions.length !== 1) throw typedError(suggestions.length > 1 ? 'ambiguous_term' : 'field_not_found', `Suggestion thématique introuvable : ${label}`);
-    await clickElement(suggestions[0], `Choisir la suggestion exacte ${label}`);
+    log('info', null, `Saisie de la thématique : ${label}`);
+    setAutocompleteInputValue(input, label);
+
+    const suggestion = await waitForFunction(() => findExactThematicSuggestion(input, label), CONFIG.MAX_WAIT_TIME, `Suggestion thématique introuvable : ${label}`).catch((error) => {
+      if (!getAutocompleteMenuForInput(input)) log('error', null, 'Menu d’autocomplétion introuvable');
+      else log('error', null, `Suggestion exacte introuvable pour ${label}`);
+      throw error;
+    });
+    const menu = getAutocompleteMenuForInput(input);
+    const wrappers = menu ? Array.from(menu.querySelectorAll('a.ui-menu-item-wrapper, .ui-menu-item-wrapper')).filter(isVisible) : [];
+    log('info', null, `Menu d’autocomplétion détecté : ${menu?.id || '(sans id)'}`);
+    log('info', null, `Nombre de suggestions cliquables : ${wrappers.length}`);
+    log('info', null, `Suggestion exacte trouvée : ${String(suggestion.textContent || '').trim()}`);
+    log('info', null, `Suggestion trouvée : ${String(suggestion.textContent || '').trim()}`);
+    clickAutocompleteWrapper(suggestion);
+
+    await sleep(Math.max(CONFIG.DELAY_BETWEEN_ACTIONS, CONFIG.THEMATIC_AUTOCOMPLETE_SELECTION_DELAY_MS));
+    log('info', null, `Valeur après clic : ${String(input.value || '').trim()}`);
+    let validated = isThematicInputValidated(input, label);
+
+    if (!validated) {
+      log('warning', null, `Le clic sur la suggestion ${label} n’a pas été validé. Tentative de secours au clavier.`);
+      input.focus();
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true, cancelable: true }));
+      await sleep(150);
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
+      await sleep(CONFIG.THEMATIC_AUTOCOMPLETE_SELECTION_DELAY_MS);
+      log('info', null, `Valeur finale du champ : ${String(input.value || '').trim()}`);
+      validated = isThematicInputValidated(input, label);
+    }
+
+    if (!validated) {
+      log('error', null, `Suggestion trouvée mais non validée par Drupal. Valeur finale du champ : ${String(input.value || '').trim()}`);
+      throw typedError('field_not_found', `La suggestion ${label} a été trouvée mais Drupal ne l’a pas validée. Valeur finale : "${String(input.value || '').trim()}".`);
+    }
+
+    log('success', null, `Thématique validée par Drupal : ${String(input.value || '').trim()}`);
     await waitForAjax();
-    await waitForFunction(() => normalizeText(input.value) !== normalizedLabel || !isVisible(input), 3000, `Thématique non validée par Drupal : ${label}`);
   }
 
   function readSimpleDrupalFields(target, values) {
