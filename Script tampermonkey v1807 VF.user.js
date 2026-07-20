@@ -1760,7 +1760,7 @@
       if (!Array.isArray(payload.items)) errors.push('items[] est obligatoire.');
     }
     if (payload.type === 'bulk_drupal_theme_public_update') {
-      if (payload.version !== '1.0') errors.push('Version bulk_drupal_theme_public_update non prise en charge.');
+      if (!['1.0', '1.1'].includes(payload.version)) errors.push('Version bulk_drupal_theme_public_update non prise en charge.');
       if (!Array.isArray(payload.targets)) errors.push('targets[] est obligatoire.');
     }
     const targets = normalizeIntranetTargets(payload);
@@ -1769,7 +1769,7 @@
     targets.forEach((target, index) => {
       if (!String(target.nodeId || '').trim()) errors.push(`Cible ${index + 1} : Node ID absent.`);
       const requested = target.changes;
-      if (!requested || typeof requested !== 'object' || Array.isArray(requested) || !Object.keys(requested).length) errors.push(`Cible ${target.nodeId || index + 1} vide : changes/expectedAfter absent.`);
+      if (!requested || typeof requested !== 'object' || Array.isArray(requested) || !Object.keys(requested).length) errors.push(`Cible ${target.nodeId || index + 1} vide : changes absent.`);
       Object.entries(requested || {}).forEach(([field, request]) => {
         if (!INTRANET_FIELDS.includes(field)) errors.push(`Cible ${target.nodeId}: champ inconnu ${field}.`);
         if (payload.type === 'update_drupal_pages') {
@@ -1782,7 +1782,7 @@
           if (field === 'title' && request?.operation === 'delete') errors.push(`Cible ${target.nodeId}, title: invalid_operation (le titre ne peut pas être vidé).`);
         }
         if (payload.type === 'bulk_drupal_theme_public_update') {
-          if (!['theme', 'publics'].includes(field)) errors.push(`Cible ${target.nodeId}: le format thématiques/publics ne reconnaît que theme et publics.`);
+          if (!['theme', 'publics', 'metiersPublics'].includes(field)) errors.push(`Cible ${target.nodeId}: le format thématiques/publics ne reconnaît que theme, publics et metiersPublics.`);
           if (!request || typeof request !== 'object' || !Array.isArray(request.values)) errors.push(`Cible ${target.nodeId}, ${field}: values doit être un tableau.`);
           else {
             if (!THEME_PUBLIC_OPERATIONS.includes(request.operation)) errors.push(`Cible ${target.nodeId}, ${field}: opération inconnue ${request.operation}.`);
@@ -1811,7 +1811,7 @@
     if (payload?.type === 'bulk_drupal_theme_public_update') return (payload.targets || []).map((target) => ({
       batchId: payload.batchId, payloadType: payload.type, nodeId: String(target.nodeId || '').trim(), pageUrl: target.pageUrl || '',
       title: target.title || '', requestedTitle: target.title || '', inventorySheet: target.inventorySheet || '', sourceOvp: target.sourceOvp || '',
-      expectedBefore: target.expectedBefore || {}, changes: target.changes || {}, expectedAfter: target.expectedAfter || {}
+      expectedBefore: target.expectedBefore || {}, changes: target.changes || {}, expectedAfter: target.expectedAfter || {}, expectedAfterContains: target.expectedAfterContains || {}
     }));
     return [];
   }
@@ -2480,7 +2480,7 @@
   }
 
   function publicPath(value) {
-    if (typeof value === 'string') return [value.trim()].filter(Boolean);
+    if (typeof value === 'string') return value.includes('>') ? value.split('>').map((part) => part.trim()).filter(Boolean) : [value.trim()].filter(Boolean);
     if (value?.path) return String(value.path).split('>').map((part) => part.trim()).filter(Boolean);
     return [value?.label || value?.id].map((entry) => String(entry || '').trim()).filter(Boolean);
   }
